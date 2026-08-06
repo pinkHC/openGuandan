@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: open-guandan-server
+    runtime: node
+    region: frankfurt
+    plan: free
+    numInstances: 1
+    buildCommand: npm ci && npm run build --workspace @open-guandan/server
+    startCommand: npm run start:server
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: CORS_ORIGIN
+        sync: false
+      - key: ROOM_IDLE_TTL_MS
+        value: "600000"
+      - key: RECONNECT_GRACE_MS
+        value: "90000"

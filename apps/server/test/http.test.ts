@@ -6,8 +6,8 @@ test("HTTP 可以创建和加入临时房间", async (context) => {
   const { app } = await buildApplication(
     {
       host: "127.0.0.1",
-      port: 3000,
-      corsOrigins: ["http://localhost:5173"],
+      port: 3004,
+      corsOrigins: ["http://localhost:5174"],
       reconnectGraceMs: 90_000,
       roomIdleTtlMs: 600_000,
     },

@@ -23,6 +23,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
+    "socket.io-client": "^4.8.3",
     "tsx": "^4.23.9",
     "typescript": "^7.0.2"
   }

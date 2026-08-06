@@ -71,7 +71,7 @@ test("识别十种规定牌型", () => {
       [card("small-joker"), card("small-joker"), card("big-joker"), card("big-joker")],
       "7",
     ).kind,
-    "all-joker",
+    "joker-bomb",
   );
 });
 

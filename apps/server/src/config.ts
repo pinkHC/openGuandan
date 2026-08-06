@@ -2,8 +2,8 @@ import { z } from "zod";
 
 const environmentSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
-  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  CORS_ORIGIN: z.string().default("http://localhost:5173"),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3004),
+  CORS_ORIGIN: z.string().default("http://localhost:5174"),
   ROOM_IDLE_TTL_MS: z.coerce.number().int().positive().default(600_000),
   RECONNECT_GRACE_MS: z.coerce.number().int().positive().default(90_000),
 });

@@ -229,7 +229,7 @@ export function listCombinations(
   const unique = new Map<string, Combination>();
   if (allJoker) {
     const combination: Combination = {
-      kind: "all-joker",
+      kind: "joker-bomb",
       size: 4,
       wildcardAssignments: {},
     };
@@ -288,7 +288,7 @@ export function resolveCombination(
 }
 
 export function isBombCombination(kind: CombinationKind): boolean {
-  return kind === "bomb" || kind === "straight-flush" || kind === "all-joker";
+  return kind === "bomb" || kind === "straight-flush" || kind === "joker-bomb";
 }
 
 function sequenceStrength(rank: OrdinaryRank): number {
@@ -299,7 +299,7 @@ function bombStrength(
   combination: Combination,
   levelRank: OrdinaryRank,
 ): readonly [number, number, number] {
-  if (combination.kind === "all-joker") return [4, 0, 0];
+  if (combination.kind === "joker-bomb") return [4, 0, 0];
   if (combination.kind === "bomb" && combination.size >= 6) {
     return [3, combination.size, cardRankStrength(combination.primaryRank as CardRank, levelRank)];
   }

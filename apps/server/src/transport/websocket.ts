@@ -132,6 +132,21 @@ export function attachWebSocket(
       });
     };
 
+    socket.on("room.sync", (rawAck?: Ack) => {
+      const ack: Ack = typeof rawAck === "function" ? rawAck : () => undefined;
+      try {
+        consumeSocketRateLimit(socket);
+        const currentRoom = rooms.requireRoom(socketIdentity.roomCode);
+        ack({
+          ok: true,
+          version: currentRoom.version,
+          snapshot: createRoomView(currentRoom, socketIdentity.participantId),
+        });
+      } catch (error) {
+        ack({ ok: false, error: errorPayload(error) });
+      }
+    });
+
     handle("room.ready", readySchema, (payload) =>
       rooms.setReady(
         socketIdentity.roomCode,

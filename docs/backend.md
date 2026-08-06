@@ -33,8 +33,8 @@ apps/server/
 | 名称 | 默认值 | 含义 |
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | 监听地址 |
-| `PORT` | `3000` | HTTP 与 WebSocket 端口 |
-| `CORS_ORIGIN` | `http://localhost:5173` | 允许的前端源；多个源用逗号分隔 |
+| `PORT` | `3004` | HTTP 与 WebSocket 端口 |
+| `CORS_ORIGIN` | `http://localhost:5174` | 允许的前端源；多个源用逗号分隔 |
 | `ROOM_IDLE_TTL_MS` | `600000` | 全员离线后房间的最长空闲时间 |
 | `RECONNECT_GRACE_MS` | `90000` | 等待大厅中为断线参与者保留身份的时间 |
 
@@ -99,7 +99,7 @@ GET /health
 ```ts
 import { io } from "socket.io-client";
 
-const socket = io("http://localhost:3000", {
+const socket = io("http://localhost:3004", {
   auth: {
     roomCode,
     participantId,
@@ -109,6 +109,14 @@ const socket = io("http://localhost:3000", {
 ```
 
 临时用户名只用于显示。实际身份由不可猜测的 `participantId` 和 `reconnectToken` 共同确认。刷新页面后使用原凭证重新连接，即可恢复原座位和手牌。
+
+连接成功或收到 `STALE_STATE` 后，客户端可以发送只读事件 `room.sync`。该事件不携带 `actionId` 或 `version`，服务器通过 acknowledgement 返回当前参与者的个性化 `snapshot`：
+
+```ts
+socket.emit("room.sync", (response) => {
+  if (response.ok) render(response.snapshot);
+});
+```
 
 ## 6. 客户端命令
 
@@ -185,7 +193,7 @@ consecutive-pairs
 consecutive-triples
 bomb
 straight-flush
-all-joker
+joker-bomb
 ```
 
 过牌使用 `round.pass`，只需发送通用的 `actionId` 和 `version`。

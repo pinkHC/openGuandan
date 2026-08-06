@@ -40,7 +40,7 @@ export const COMBINATION_KINDS = [
   "consecutive-triples",
   "bomb",
   "straight-flush",
-  "all-joker",
+  "joker-bomb",
 ] as const;
 
 export type CombinationKind = (typeof COMBINATION_KINDS)[number];

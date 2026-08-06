@@ -1,42 +1,52 @@
 {
   "cardTypes": [
     {
+      "id": "single",
       "zh": "单张",
       "en": "single"
     },
     {
+      "id": "pair",
       "zh": "对子",
       "en": "pair"
     },
     {
+      "id": "triple",
       "zh": "三同张",
       "en": "triple"
     },
     {
+      "id": "full-house",
       "zh": "三带二",
       "en": "full house"
     },
     {
+      "id": "straight",
       "zh": "顺子",
       "en": "straight"
     },
     {
+      "id": "consecutive-pairs",
       "zh": "三连对",
       "en": "consecutive pairs"
     },
     {
+      "id": "consecutive-triples",
       "zh": "钢板",
       "en": "consecutive triples"
     },
     {
+      "id": "bomb",
       "zh": "炸弹",
       "en": "bomb"
     },
     {
+      "id": "straight-flush",
       "zh": "同花顺",
       "en": "straight flush"
     },
     {
+      "id": "joker-bomb",
       "zh": "天王炸",
       "en": "joker bomb"
     }
