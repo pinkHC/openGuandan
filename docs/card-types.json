@@ -1,0 +1,44 @@
+{
+  "cardTypes": [
+    {
+      "zh": "单张",
+      "en": "single"
+    },
+    {
+      "zh": "对子",
+      "en": "pair"
+    },
+    {
+      "zh": "三同张",
+      "en": "triple"
+    },
+    {
+      "zh": "三带二",
+      "en": "full house"
+    },
+    {
+      "zh": "顺子",
+      "en": "straight"
+    },
+    {
+      "zh": "三连对",
+      "en": "consecutive pairs"
+    },
+    {
+      "zh": "钢板",
+      "en": "consecutive triples"
+    },
+    {
+      "zh": "炸弹",
+      "en": "bomb"
+    },
+    {
+      "zh": "同花顺",
+      "en": "straight flush"
+    },
+    {
+      "zh": "天王炸",
+      "en": "joker bomb"
+    }
+  ]
+}
