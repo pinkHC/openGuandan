@@ -87,7 +87,7 @@ function JoinRoom({ roomCode, onJoined }: { roomCode: string; onJoined: (credent
   }
   return (
     <main className="join-shell">
-      <header className="site-header"><Brand /><Link href="/rules">玩法规则</Link></header>
+      <header className="site-header"><Brand /><Link prefetch={false} href="/rules">玩法规则</Link></header>
       <section className="join-card">
         <p className="eyebrow"><span /> 加入牌桌</p>
         <h1>房间 <strong>{roomCode}</strong></h1>
@@ -98,7 +98,7 @@ function JoinRoom({ roomCode, onJoined }: { roomCode: string; onJoined: (credent
           <button className="button button--gold" type="submit" disabled={busy}>{busy ? "正在加入…" : "进入房间"}<span>→</span></button>
         </form>
         {error && <p className="form-error" role="alert">{error}</p>}
-        <Link className="text-link" href="/">← 返回首页</Link>
+        <Link prefetch={false} className="text-link" href="/">← 返回首页</Link>
       </section>
     </main>
   );
@@ -232,7 +232,7 @@ export function RoomClient({ roomCode }: { roomCode: string }) {
       <header className="room-header">
         <Brand compact />
         <div className="room-header__code"><small>房间码</small><button type="button" onClick={copyRoomCode}>{roomCode}<span aria-hidden="true">复制</span></button></div>
-        <div className="room-header__actions"><span className={`connection-pill connection-pill--${connection}`}><i />{connectionCopy(connection)}</span><Link href="/rules" target="_blank">规则</Link><button className="plain-button" type="button" onClick={leaveRoom}>离开</button></div>
+        <div className="room-header__actions"><span className={`connection-pill connection-pill--${connection}`}><i />{connectionCopy(connection)}</span><Link prefetch={false} href="/rules" target="_blank">规则</Link><button className="plain-button" type="button" onClick={leaveRoom}>离开</button></div>
       </header>
 
       {connection !== "connected" && <div className="status-banner" role="status"><b>{connection === "waking" ? "免费服务器正在唤醒" : "正在恢复连接"}</b><span>{connection === "waking" ? "首次访问可能需要约一分钟，请保持页面打开。" : "连接恢复后会自动同步最新牌桌。"}</span></div>}

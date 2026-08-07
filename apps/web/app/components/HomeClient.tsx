@@ -56,7 +56,7 @@ export function HomeClient() {
       <header className="site-header">
         <Brand />
         <nav aria-label="主导航">
-          <Link href="/rules">玩法规则</Link>
+          <Link prefetch={false} href="/rules">玩法规则</Link>
           <a className="header-pill" href="#start">开始游戏</a>
         </nav>
       </header>
@@ -119,7 +119,7 @@ export function HomeClient() {
         {error && <p className="form-error" role="alert">{error}</p>}
       </section>
 
-      <footer className="home-footer"><Brand compact /><p>开源、轻量、不保存历史牌局。</p><Link href="/rules">查看完整规则 →</Link></footer>
+      <footer className="home-footer"><Brand compact /><p>开源、轻量、不保存历史牌局。</p><Link prefetch={false} href="/rules">查看完整规则 →</Link></footer>
     </main>
   );
 }

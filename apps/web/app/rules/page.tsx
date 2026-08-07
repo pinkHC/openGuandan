@@ -21,7 +21,7 @@ const structures = [
 export default function RulesPage() {
   return (
     <main className="rules-shell">
-      <header className="site-header"><Brand /><nav><Link href="/">返回首页</Link><Link className="header-pill" href="/#start">开始游戏</Link></nav></header>
+      <header className="site-header"><Brand /><nav><Link prefetch={false} href="/">返回首页</Link><Link prefetch={false} className="header-pill" href="/#start">开始游戏</Link></nav></header>
       <section className="rules-hero"><p className="eyebrow"><span /> openGuandan 规则</p><h1>先懂牌，再懂搭档。</h1><p>四人分为两队，相对而坐的玩家互为搭档。每位玩家获得 27 张牌，目标是在每轮牌中与搭档配合，尽快出完手牌。</p><div className="rules-jump"><a href="#cards">牌型</a><a href="#compare">大小比较</a><a href="#play">出牌</a><a href="#tribute">贡还牌</a><a href="#level">升级</a></div></section>
 
       <div className="rules-content">
@@ -40,8 +40,8 @@ export default function RulesPage() {
           <section id="tribute"><span className="section-number">06</span><div><h2>贡牌与还牌</h2><h3>单贡</h3><p>上一轮下游向上游进贡手中点数最大的合资格牌；红桃级牌不能用于进贡。上游还一张不超过 10 的牌，随后由进贡者领出。</p><h3>双贡</h3><p>双下方两人各贡最大牌。上游取得较大的贡牌，其搭档取得较小的贡牌，并分别还牌。</p><h3>抗贡</h3><p>单贡者持两张大王，或双下方合计持两张大王时抗贡，不交换牌，由上一轮上游领出。</p></div></section>
         </article>
       </div>
-      <section className="rules-cta"><p className="eyebrow"><span /> 规则看完了</p><h2>找三位朋友，开一桌。</h2><Link className="button button--gold" href="/#start">开始游戏 <span>→</span></Link></section>
-      <footer className="home-footer"><Brand compact /><p>本页为 openGuandan 核心规则摘要。</p><Link href="/">返回首页 →</Link></footer>
+      <section className="rules-cta"><p className="eyebrow"><span /> 规则看完了</p><h2>找三位朋友，开一桌。</h2><Link prefetch={false} className="button button--gold" href="/#start">开始游戏 <span>→</span></Link></section>
+      <footer className="home-footer"><Brand compact /><p>本页为 openGuandan 核心规则摘要。</p><Link prefetch={false} href="/">返回首页 →</Link></footer>
     </main>
   );
 }
