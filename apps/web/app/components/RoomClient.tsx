@@ -247,7 +247,7 @@ export function RoomClient({ roomCode }: { roomCode: string }) {
           <div className="lobby-heading"><div><p className="eyebrow"><span /> 等候大厅</p><h1>坐满四人，准备开局。</h1><p>相对而坐的玩家互为搭档。房主在所有人准备后开始本局。</p></div><div className="team-legend"><span><i className="team-a" />甲队 · 座位 1、3</span><span><i className="team-b" />乙队 · 座位 2、4</span></div></div>
           <div className="lobby-layout">
             <div className="lobby-table">
-              <div className="lobby-table__felt"><span className="felt-mark">惯<br />蛋</span>{SEATS.map((seat) => <SeatBadge key={seat} snapshot={snapshot} seat={seat} selfSeat={snapshot.self?.seat ?? 0} showReady />)}</div>
+              <div className="lobby-table__felt"><span className="felt-mark">掼<br />蛋</span>{SEATS.map((seat) => <SeatBadge key={seat} snapshot={snapshot} seat={seat} selfSeat={snapshot.self?.seat ?? 0} showReady />)}</div>
             </div>
             <aside className="lobby-sidebar">
               <div className="sidebar-card"><span className="sidebar-card__number">{snapshot.seats.filter(Boolean).length}<small>/4</small></span><div><b>玩家已入座</b><p>{snapshot.seats.every(Boolean) ? "人员到齐，等待全部准备。" : "把房间码分享给朋友。"}</p></div></div>
