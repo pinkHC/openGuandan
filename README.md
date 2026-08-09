@@ -4,14 +4,15 @@
 
 ```text
 apps/
-  server/   TypeScript、Fastify、Socket.IO 后端
+  server/   Rust、Axum、socketioxide 后端
   web/      React、Vinext 前端
 docs/       规则、接口和设计文档
 ```
 
 ## 运行
 
-要求 Node.js 22.13 或更高版本。
+要求 Node.js 22.13 或更高版本，以及 Rust 1.94 或更高版本。Rust 工具链需要包含
+`rustfmt` 和 `clippy` 组件。
 
 ```powershell
 npm install
@@ -37,6 +38,13 @@ npm run start:server
 ```powershell
 npm test
 npm run typecheck
+```
+
+Rust 格式与静态检查：
+
+```powershell
+npm run fmt --workspace @open-guandan/server
+npm run clippy --workspace @open-guandan/server
 ```
 
 ## 文档
