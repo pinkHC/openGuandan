@@ -14,18 +14,24 @@
 
 代码内部使用 `RoundState` 表示一轮牌，使用 `MatchState` 表示从 2 打到 A 的完整一局牌。
 
+服务端是一个 Rust crate，使用 Tokio 运行异步任务、Axum 提供 HTTP 接口，并通过
+socketioxide 实现与官方 Socket.IO JavaScript 客户端兼容的实时通信。
+
 ## 2. 目录
 
 ```text
 apps/server/
+  Cargo.toml     Rust crate 与依赖配置
   src/
     domain/       牌张、牌型、轮牌和一局牌规则
     rooms/        房间、临时身份、内存存储和命令处理
-    transport/    HTTP、Socket.IO 和输入校验
+    transport/    Axum HTTP、socketioxide 事件和输入校验
     views/        玩家与旁观者的个性化状态视图
-    app.ts        应用组装
-    index.ts      进程入口
-  test/           自动化测试
+    app.rs        应用组装
+    config.rs     环境变量解析
+    lib.rs        可测试的服务端库入口
+    main.rs       进程入口
+  tests/          集成测试
 ```
 
 ## 3. 环境变量
@@ -35,6 +41,7 @@ apps/server/
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `3004` | HTTP 与 WebSocket 端口 |
 | `CORS_ORIGIN` | `http://localhost:5174` | 允许的前端源；多个源用逗号分隔 |
+| `TRUST_PROXY` | `false` | 是否信任 `X-Forwarded-For` 的首个客户端地址；Render 配置为 `true` |
 | `ROOM_IDLE_TTL_MS` | `600000` | 全员离线后房间的最长空闲时间 |
 | `RECONNECT_GRACE_MS` | `90000` | 等待大厅中为断线参与者保留身份的时间 |
 
@@ -238,5 +245,6 @@ joker-bomb
 - 座位玩家断线后，一局牌暂停，直到其使用原重连令牌回来。
 - 房主可以使用 `match.abort` 结束无法继续的一局牌。
 - 等待阶段的断线参与者超过宽限时间后会被移出房间并释放座位。
+- 清理造成的座位、房主或版本变化会通过同一个有序 outbox 立即发布。
 - 所有人离线且房间超过空闲期限后，房间从内存中删除。
 - 当前实现是单进程部署；若以后需要多实例，应将活动房间状态和 Socket.IO adapter 迁移到带 TTL 的 Redis，但仍无需保存历史牌谱。
