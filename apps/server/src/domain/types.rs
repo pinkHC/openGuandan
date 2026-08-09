@@ -1,261 +1,128 @@
-use std::fmt;
-
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
-pub const ORDINARY_RANKS: [OrdinaryRank; 13] = [
-    OrdinaryRank::Two,
-    OrdinaryRank::Three,
-    OrdinaryRank::Four,
-    OrdinaryRank::Five,
-    OrdinaryRank::Six,
-    OrdinaryRank::Seven,
-    OrdinaryRank::Eight,
-    OrdinaryRank::Nine,
-    OrdinaryRank::Ten,
-    OrdinaryRank::Jack,
-    OrdinaryRank::Queen,
-    OrdinaryRank::King,
-    OrdinaryRank::Ace,
-];
+macro_rules! define_ordinary_family {
+    (
+        $ordinary:ident, $full:ident, $values:ident[$length:literal];
+        ordinary { $($variant:ident => $wire_name:literal),+ $(,)? }
+        extras { $($extra:ident => $extra_wire_name:literal),+ $(,)? }
+    ) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[repr(u8)]
+        pub enum $ordinary {
+            $(#[serde(rename = $wire_name)] $variant),+
+        }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum OrdinaryRank {
-    #[serde(rename = "2")]
-    Two,
-    #[serde(rename = "3")]
-    Three,
-    #[serde(rename = "4")]
-    Four,
-    #[serde(rename = "5")]
-    Five,
-    #[serde(rename = "6")]
-    Six,
-    #[serde(rename = "7")]
-    Seven,
-    #[serde(rename = "8")]
-    Eight,
-    #[serde(rename = "9")]
-    Nine,
-    #[serde(rename = "10")]
-    Ten,
-    #[serde(rename = "J")]
-    Jack,
-    #[serde(rename = "Q")]
-    Queen,
-    #[serde(rename = "K")]
-    King,
-    #[serde(rename = "A")]
-    Ace,
+        pub const $values: [$ordinary; $length] = [$($ordinary::$variant),+];
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[repr(u8)]
+        pub enum $full {
+            $(#[serde(rename = $wire_name)] $variant,)+
+            $(#[serde(rename = $extra_wire_name)] $extra),+
+        }
+
+        impl $full {
+            pub const fn as_ordinary(self) -> Option<$ordinary> {
+                if (self as usize) < $values.len() {
+                    Some($values[self as usize])
+                } else {
+                    None
+                }
+            }
+
+            pub const fn as_str(self) -> &'static str {
+                const LABELS: &[&str] = &[$($wire_name),+, $($extra_wire_name),+];
+                LABELS[self as usize]
+            }
+        }
+
+        impl From<$ordinary> for $full {
+            fn from(value: $ordinary) -> Self {
+                match value { $($ordinary::$variant => Self::$variant),+ }
+            }
+        }
+    };
 }
+
+define_ordinary_family!(
+    OrdinaryRank, CardRank, ORDINARY_RANKS[13];
+    ordinary {
+        Two => "2",
+        Three => "3",
+        Four => "4",
+        Five => "5",
+        Six => "6",
+        Seven => "7",
+        Eight => "8",
+        Nine => "9",
+        Ten => "10",
+        Jack => "J",
+        Queen => "Q",
+        King => "K",
+        Ace => "A",
+    }
+    extras {
+        SmallJoker => "small-joker",
+        BigJoker => "big-joker",
+    }
+);
 
 impl OrdinaryRank {
     pub const fn index(self) -> usize {
-        match self {
-            Self::Two => 0,
-            Self::Three => 1,
-            Self::Four => 2,
-            Self::Five => 3,
-            Self::Six => 4,
-            Self::Seven => 5,
-            Self::Eight => 6,
-            Self::Nine => 7,
-            Self::Ten => 8,
-            Self::Jack => 9,
-            Self::Queen => 10,
-            Self::King => 11,
-            Self::Ace => 12,
+        self as usize
+    }
+}
+
+define_ordinary_family!(
+    OrdinarySuit, Suit, ORDINARY_SUITS[4];
+    ordinary {
+        Heart => "heart",
+        Diamond => "diamond",
+        Club => "club",
+        Spade => "spade",
+    }
+    extras {
+        Joker => "joker",
+    }
+);
+
+macro_rules! bounded_index_type {
+    ($name:ident, $upper_bound:literal, $message:literal) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(u8);
+
+        impl $name {
+            pub const fn new(value: u8) -> Option<Self> {
+                if value < $upper_bound {
+                    Some(Self(value))
+                } else {
+                    None
+                }
+            }
+
+            pub const fn index(self) -> usize {
+                self.0 as usize
+            }
         }
-    }
 
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Two => "2",
-            Self::Three => "3",
-            Self::Four => "4",
-            Self::Five => "5",
-            Self::Six => "6",
-            Self::Seven => "7",
-            Self::Eight => "8",
-            Self::Nine => "9",
-            Self::Ten => "10",
-            Self::Jack => "J",
-            Self::Queen => "Q",
-            Self::King => "K",
-            Self::Ace => "A",
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = u8::deserialize(deserializer)?;
+                Self::new(value).ok_or_else(|| serde::de::Error::custom($message))
+            }
         }
-    }
+    };
 }
 
-impl fmt::Display for OrdinaryRank {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum CardRank {
-    #[serde(rename = "2")]
-    Two,
-    #[serde(rename = "3")]
-    Three,
-    #[serde(rename = "4")]
-    Four,
-    #[serde(rename = "5")]
-    Five,
-    #[serde(rename = "6")]
-    Six,
-    #[serde(rename = "7")]
-    Seven,
-    #[serde(rename = "8")]
-    Eight,
-    #[serde(rename = "9")]
-    Nine,
-    #[serde(rename = "10")]
-    Ten,
-    #[serde(rename = "J")]
-    Jack,
-    #[serde(rename = "Q")]
-    Queen,
-    #[serde(rename = "K")]
-    King,
-    #[serde(rename = "A")]
-    Ace,
-    #[serde(rename = "small-joker")]
-    SmallJoker,
-    #[serde(rename = "big-joker")]
-    BigJoker,
-}
-
-impl CardRank {
-    pub const fn as_ordinary(self) -> Option<OrdinaryRank> {
-        match self {
-            Self::Two => Some(OrdinaryRank::Two),
-            Self::Three => Some(OrdinaryRank::Three),
-            Self::Four => Some(OrdinaryRank::Four),
-            Self::Five => Some(OrdinaryRank::Five),
-            Self::Six => Some(OrdinaryRank::Six),
-            Self::Seven => Some(OrdinaryRank::Seven),
-            Self::Eight => Some(OrdinaryRank::Eight),
-            Self::Nine => Some(OrdinaryRank::Nine),
-            Self::Ten => Some(OrdinaryRank::Ten),
-            Self::Jack => Some(OrdinaryRank::Jack),
-            Self::Queen => Some(OrdinaryRank::Queen),
-            Self::King => Some(OrdinaryRank::King),
-            Self::Ace => Some(OrdinaryRank::Ace),
-            Self::SmallJoker | Self::BigJoker => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Two => "2",
-            Self::Three => "3",
-            Self::Four => "4",
-            Self::Five => "5",
-            Self::Six => "6",
-            Self::Seven => "7",
-            Self::Eight => "8",
-            Self::Nine => "9",
-            Self::Ten => "10",
-            Self::Jack => "J",
-            Self::Queen => "Q",
-            Self::King => "K",
-            Self::Ace => "A",
-            Self::SmallJoker => "small-joker",
-            Self::BigJoker => "big-joker",
-        }
-    }
-}
-
-impl From<OrdinaryRank> for CardRank {
-    fn from(rank: OrdinaryRank) -> Self {
-        match rank {
-            OrdinaryRank::Two => Self::Two,
-            OrdinaryRank::Three => Self::Three,
-            OrdinaryRank::Four => Self::Four,
-            OrdinaryRank::Five => Self::Five,
-            OrdinaryRank::Six => Self::Six,
-            OrdinaryRank::Seven => Self::Seven,
-            OrdinaryRank::Eight => Self::Eight,
-            OrdinaryRank::Nine => Self::Nine,
-            OrdinaryRank::Ten => Self::Ten,
-            OrdinaryRank::Jack => Self::Jack,
-            OrdinaryRank::Queen => Self::Queen,
-            OrdinaryRank::King => Self::King,
-            OrdinaryRank::Ace => Self::Ace,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Suit {
-    Heart,
-    Diamond,
-    Club,
-    Spade,
-    Joker,
-}
-
-impl Suit {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Heart => "heart",
-            Self::Diamond => "diamond",
-            Self::Club => "club",
-            Self::Spade => "spade",
-            Self::Joker => "joker",
-        }
-    }
-
-    pub const fn as_ordinary(self) -> Option<OrdinarySuit> {
-        match self {
-            Self::Heart => Some(OrdinarySuit::Heart),
-            Self::Diamond => Some(OrdinarySuit::Diamond),
-            Self::Club => Some(OrdinarySuit::Club),
-            Self::Spade => Some(OrdinarySuit::Spade),
-            Self::Joker => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OrdinarySuit {
-    Heart,
-    Diamond,
-    Club,
-    Spade,
-}
-
-impl From<OrdinarySuit> for Suit {
-    fn from(suit: OrdinarySuit) -> Self {
-        match suit {
-            OrdinarySuit::Heart => Self::Heart,
-            OrdinarySuit::Diamond => Self::Diamond,
-            OrdinarySuit::Club => Self::Club,
-            OrdinarySuit::Spade => Self::Spade,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Seat(u8);
+bounded_index_type!(Seat, 4, "seat must be between 0 and 3");
 
 impl Seat {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1);
     pub const TWO: Self = Self(2);
     pub const THREE: Self = Self(3);
-
-    pub const fn new(value: u8) -> Option<Self> {
-        if value < 4 { Some(Self(value)) } else { None }
-    }
-
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
 
     pub const fn value(self) -> u8 {
         self.0
@@ -278,72 +145,11 @@ impl Seat {
     }
 }
 
-impl Serialize for Seat {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u8(self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Seat {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u8::deserialize(deserializer)?;
-        Self::new(value).ok_or_else(|| serde::de::Error::custom("seat must be between 0 and 3"))
-    }
-}
-
-impl From<Seat> for usize {
-    fn from(seat: Seat) -> Self {
-        seat.index()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Team(u8);
+bounded_index_type!(Team, 2, "team must be 0 or 1");
 
 impl Team {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1);
-
-    pub const fn new(value: u8) -> Option<Self> {
-        if value < 2 { Some(Self(value)) } else { None }
-    }
-
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    pub const fn value(self) -> u8 {
-        self.0
-    }
-
-    pub const fn all() -> [Self; 2] {
-        [Self::ZERO, Self::ONE]
-    }
-}
-
-impl Serialize for Team {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u8(self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Team {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u8::deserialize(deserializer)?;
-        Self::new(value).ok_or_else(|| serde::de::Error::custom("team must be 0 or 1"))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,13 +198,27 @@ pub struct Combination {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CombinationDeclaration {
     pub kind: CombinationKind,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_rank: Option<CardRank>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence_top: Option<OrdinaryRank>,
+}
+
+/// Preserves the wire-level distinction between an omitted optional field and
+/// an explicit JSON `null`, matching the client schema.
+pub(crate) fn deserialize_optional_non_null<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[cfg(test)]
@@ -406,12 +226,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_numeric_seat_and_team_serde() {
+    fn wire_values_and_checked_numeric_types_match() {
         assert_eq!(serde_json::to_string(&Seat::THREE).unwrap(), "3");
         assert_eq!(serde_json::from_str::<Seat>("2").unwrap(), Seat::TWO);
         assert!(serde_json::from_str::<Seat>("4").is_err());
         assert_eq!(serde_json::to_string(&Team::ONE).unwrap(), "1");
         assert!(serde_json::from_str::<Team>("2").is_err());
+        let heart = serde_json::to_string(&OrdinarySuit::Heart).unwrap();
+        assert_eq!(heart, "\"heart\"");
+    }
+
+    #[test]
+    fn ordinary_rank_indices_and_card_ranks_stay_aligned() {
+        for (index, rank) in ORDINARY_RANKS.into_iter().enumerate() {
+            assert_eq!(rank.index(), index);
+            assert_eq!(CardRank::from(rank).as_ordinary(), Some(rank));
+        }
+        assert_eq!(CardRank::SmallJoker.as_ordinary(), None);
     }
 
     #[test]

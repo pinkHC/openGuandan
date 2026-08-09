@@ -26,7 +26,7 @@ pub struct MatchState {
     pub next_level_owner_team: Option<Team>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchActionOutcome {
     pub round_result: Option<RoundResult>,
@@ -38,14 +38,16 @@ pub fn advance_level(rank: OrdinaryRank, steps: u8) -> OrdinaryRank {
     ORDINARY_RANKS[next_index]
 }
 
+const INITIAL_ROUND_OPTIONS: CreateRoundOptions = CreateRoundOptions {
+    number: 1,
+    level_rank: OrdinaryRank::Two,
+    level_owner_team: None,
+    previous_result: None,
+};
+
 pub fn create_match() -> MatchState {
-    let current_round = create_round(CreateRoundOptions {
-        number: 1,
-        level_rank: OrdinaryRank::Two,
-        level_owner_team: None,
-        previous_result: None,
-    })
-    .expect("a freshly-created round is internally valid");
+    let current_round =
+        create_round(INITIAL_ROUND_OPTIONS).expect("a freshly-created round is internally valid");
     initial_match(current_round)
 }
 
@@ -53,15 +55,7 @@ pub fn create_match_with_random<F>(random_index: &mut F) -> Result<MatchState, R
 where
     F: FnMut(usize) -> usize + ?Sized,
 {
-    let current_round = create_round_with_random(
-        CreateRoundOptions {
-            number: 1,
-            level_rank: OrdinaryRank::Two,
-            level_owner_team: None,
-            previous_result: None,
-        },
-        random_index,
-    )?;
+    let current_round = create_round_with_random(INITIAL_ROUND_OPTIONS, random_index)?;
     Ok(initial_match(current_round))
 }
 
@@ -78,13 +72,10 @@ fn initial_match(current_round: RoundState) -> MatchState {
 }
 
 fn require_round(match_state: &mut MatchState) -> Result<&mut RoundState, RuleError> {
-    if match_state.phase != MatchPhase::Playing {
-        return Err(RuleError::new("NO_ACTIVE_ROUND", "当前没有进行中的轮牌"));
+    match (match_state.phase, match_state.current_round.as_mut()) {
+        (MatchPhase::Playing, Some(round)) => Ok(round),
+        _ => Err(RuleError::new("NO_ACTIVE_ROUND", "当前没有进行中的轮牌")),
     }
-    match_state
-        .current_round
-        .as_mut()
-        .ok_or_else(|| RuleError::new("NO_ACTIVE_ROUND", "当前没有进行中的轮牌"))
 }
 
 fn settle_round(
@@ -97,9 +88,10 @@ fn settle_round(
         && result.partner_placement != 4;
 
     if passed_ace {
+        let winner = result.winner_team;
         return Ok(MatchActionOutcome {
-            round_result: Some(result.clone()),
-            match_winner: Some(result.winner_team),
+            round_result: Some(result),
+            match_winner: Some(winner),
         });
     }
 
@@ -132,10 +124,7 @@ pub fn play_match_cards(
     let result = play_cards(require_round(match_state)?, seat, card_ids, declaration)?;
     match result {
         Some(result) => settle_round(match_state, result),
-        None => Ok(MatchActionOutcome {
-            round_result: None,
-            match_winner: None,
-        }),
+        None => Ok(MatchActionOutcome::default()),
     }
 }
 
@@ -160,23 +149,8 @@ pub fn return_match_tribute(
 }
 
 pub fn start_next_round(match_state: &mut MatchState) -> Result<&RoundState, RuleError> {
-    if match_state.phase != MatchPhase::BetweenRounds || match_state.current_round.is_some() {
-        return Err(RuleError::new(
-            "ROUND_ALREADY_ACTIVE",
-            "当前并非轮牌间隔阶段",
-        ));
-    }
-    let previous_result = match_state
-        .previous_round_result
-        .clone()
-        .ok_or_else(|| RuleError::internal("Missing previous round result"))?;
-    let round = create_round(CreateRoundOptions {
-        number: match_state.next_round_number,
-        level_rank: match_state.next_level_rank,
-        level_owner_team: match_state.next_level_owner_team,
-        previous_result: Some(previous_result),
-    })?;
-    install_next_round(match_state, round)
+    let round = create_round(next_round_options(match_state)?)?;
+    Ok(install_next_round(match_state, round))
 }
 
 pub fn start_next_round_with_random<'a, F>(
@@ -186,6 +160,11 @@ pub fn start_next_round_with_random<'a, F>(
 where
     F: FnMut(usize) -> usize + ?Sized,
 {
+    let round = create_round_with_random(next_round_options(match_state)?, random_index)?;
+    Ok(install_next_round(match_state, round))
+}
+
+fn next_round_options(match_state: &MatchState) -> Result<CreateRoundOptions, RuleError> {
     if match_state.phase != MatchPhase::BetweenRounds || match_state.current_round.is_some() {
         return Err(RuleError::new(
             "ROUND_ALREADY_ACTIVE",
@@ -196,76 +175,24 @@ where
         .previous_round_result
         .clone()
         .ok_or_else(|| RuleError::internal("Missing previous round result"))?;
-    let round = create_round_with_random(
-        CreateRoundOptions {
-            number: match_state.next_round_number,
-            level_rank: match_state.next_level_rank,
-            level_owner_team: match_state.next_level_owner_team,
-            previous_result: Some(previous_result),
-        },
-        random_index,
-    )?;
-    install_next_round(match_state, round)
+    Ok(CreateRoundOptions {
+        number: match_state.next_round_number,
+        level_rank: match_state.next_level_rank,
+        level_owner_team: match_state.next_level_owner_team,
+        previous_result: Some(previous_result),
+    })
 }
 
-fn install_next_round(
-    match_state: &mut MatchState,
-    round: RoundState,
-) -> Result<&RoundState, RuleError> {
-    match_state.current_round = Some(round);
+fn install_next_round(match_state: &mut MatchState, round: RoundState) -> &RoundState {
     match_state.phase = MatchPhase::Playing;
     match_state.next_round_number += 1;
-    match_state
-        .current_round
-        .as_ref()
-        .ok_or_else(|| RuleError::internal("Failed to install next round"))
+    match_state.current_round.insert(round)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use indexmap::IndexSet;
-
     use super::*;
-    use crate::domain::round::{RoundPhase, pass_turn};
-    use crate::domain::types::{Card, CardRank, Suit};
-
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-    fn card(rank: CardRank) -> Card {
-        Card {
-            id: format!("match-card-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
-            deck_index: 0,
-            rank,
-            suit: if matches!(rank, CardRank::SmallJoker | CardRank::BigJoker) {
-                Suit::Joker
-            } else {
-                Suit::Spade
-            },
-        }
-    }
-
-    fn simple_round(level_rank: OrdinaryRank) -> RoundState {
-        RoundState {
-            number: 1,
-            level_rank,
-            level_owner_team: None,
-            phase: RoundPhase::Playing,
-            hands: [
-                vec![card(CardRank::Three)],
-                vec![card(CardRank::Four), card(CardRank::Eight)],
-                vec![card(CardRank::Five)],
-                vec![card(CardRank::Six), card(CardRank::Nine)],
-            ],
-            active_seats: Seat::all().into_iter().collect::<IndexSet<_>>(),
-            turn_seat: Seat::ZERO,
-            current_play: None,
-            consecutive_passes: 0,
-            finish_order: Vec::new(),
-            tribute: None,
-        }
-    }
+    use crate::domain::test_support::simple_round;
 
     fn play_only_card(match_state: &mut MatchState, seat: Seat) -> MatchActionOutcome {
         let card_id = match_state.current_round.as_ref().unwrap().hands[seat.index()][0]
@@ -368,28 +295,13 @@ mod tests {
         let mut match_state = create_match_with_random(&mut |_| 0).unwrap();
         match_state.phase = MatchPhase::BetweenRounds;
         match_state.current_round = None;
-        assert_eq!(
-            pass_match_turn(&mut match_state, Seat::ZERO)
-                .unwrap_err()
-                .code,
-            "NO_ACTIVE_ROUND"
-        );
+        let error = pass_match_turn(&mut match_state, Seat::ZERO).unwrap_err();
+        assert_eq!(error.code, "NO_ACTIVE_ROUND");
     }
 
     #[test]
     fn match_wire_phase_is_between_rounds() {
-        assert_eq!(
-            serde_json::to_string(&MatchPhase::BetweenRounds).unwrap(),
-            "\"between-rounds\""
-        );
-    }
-
-    #[test]
-    fn imported_round_pass_helper_is_consistent() {
-        let mut round = simple_round(OrdinaryRank::Seven);
-        assert_eq!(
-            pass_turn(&mut round, Seat::ZERO).unwrap_err().code,
-            "CANNOT_PASS_WHEN_LEADING"
-        );
+        let phase = serde_json::to_string(&MatchPhase::BetweenRounds).unwrap();
+        assert_eq!(phase, "\"between-rounds\"");
     }
 }

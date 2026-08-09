@@ -268,86 +268,63 @@ fn clockwise_distance(from: Seat, to: Seat) -> u8 {
 }
 
 fn finalize_contributions(round: &mut RoundState) -> Result<(), RuleError> {
-    {
-        let tribute = round
-            .tribute
-            .as_mut()
-            .ok_or_else(|| RuleError::internal("Missing tribute state"))?;
-        if tribute.kind == TributeKind::Double {
-            let first_giver = tribute
-                .givers
-                .first()
-                .copied()
-                .ok_or_else(|| RuleError::internal("Incomplete double tribute"))?;
-            let second_giver = tribute
-                .givers
-                .get(1)
-                .copied()
-                .ok_or_else(|| RuleError::internal("Incomplete double tribute"))?;
-            let first_card = tribute
-                .contributions
-                .get(&first_giver)
-                .ok_or_else(|| RuleError::internal("Incomplete double tribute"))?;
-            let second_card = tribute
-                .contributions
-                .get(&second_giver)
-                .ok_or_else(|| RuleError::internal("Incomplete double tribute"))?;
-            let previous_second = tribute
-                .previous_second
-                .ok_or_else(|| RuleError::internal("Incomplete double tribute"))?;
+    let tribute = round
+        .tribute
+        .as_mut()
+        .ok_or_else(|| RuleError::internal("Missing tribute state"))?;
+    if tribute.kind == TributeKind::Double {
+        let incomplete = || RuleError::internal("Incomplete double tribute");
+        let &[first_giver, second_giver, ..] = tribute.givers.as_slice() else {
+            return Err(incomplete());
+        };
+        let first_card = tribute
+            .contributions
+            .get(&first_giver)
+            .ok_or_else(&incomplete)?;
+        let second_card = tribute
+            .contributions
+            .get(&second_giver)
+            .ok_or_else(&incomplete)?;
+        let previous_second = tribute.previous_second.ok_or_else(&incomplete)?;
 
-            let first_strength = card_rank_strength(first_card.rank, round.level_rank);
-            let second_strength = card_rank_strength(second_card.rank, round.level_rank);
-            let higher_giver = if first_strength > second_strength {
-                first_giver
-            } else if second_strength > first_strength {
-                second_giver
-            } else if clockwise_distance(tribute.previous_first, first_giver)
-                <= clockwise_distance(tribute.previous_first, second_giver)
-            {
-                first_giver
-            } else {
-                second_giver
-            };
-            let lower_giver = if higher_giver == first_giver {
-                second_giver
-            } else {
-                first_giver
-            };
-            tribute
-                .receiver_for_giver
-                .insert(higher_giver, tribute.previous_first);
-            tribute
-                .receiver_for_giver
-                .insert(lower_giver, previous_second);
-            tribute.leader_seat = Some(higher_giver);
-        }
+        let first_strength = card_rank_strength(first_card.rank, round.level_rank);
+        let second_strength = card_rank_strength(second_card.rank, round.level_rank);
+        let first_wins = first_strength > second_strength
+            || first_strength == second_strength
+                && clockwise_distance(tribute.previous_first, first_giver)
+                    <= clockwise_distance(tribute.previous_first, second_giver);
+        let (higher_giver, lower_giver) = if first_wins {
+            (first_giver, second_giver)
+        } else {
+            (second_giver, first_giver)
+        };
+        tribute
+            .receiver_for_giver
+            .insert(higher_giver, tribute.previous_first);
+        tribute
+            .receiver_for_giver
+            .insert(lower_giver, previous_second);
+        tribute.leader_seat = Some(higher_giver);
     }
 
-    let transfers = {
-        let tribute = round
-            .tribute
-            .as_ref()
-            .ok_or_else(|| RuleError::internal("Missing tribute state"))?;
-        tribute
-            .contributions
-            .iter()
-            .map(|(giver, card)| {
-                tribute
-                    .receiver_for_giver
-                    .get(giver)
-                    .copied()
-                    .map(|receiver| (*giver, receiver, card.clone()))
-                    .ok_or_else(|| RuleError::internal("Tribute receiver was not assigned"))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let transfers = tribute
+        .contributions
+        .iter()
+        .map(|(giver, card)| {
+            tribute
+                .receiver_for_giver
+                .get(giver)
+                .copied()
+                .map(|receiver| (*giver, receiver, card.clone()))
+                .ok_or_else(|| RuleError::internal("Tribute receiver was not assigned"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     for (giver, receiver, card) in transfers {
         remove_one_card(&mut round.hands[giver.index()], &card.id);
         round.hands[receiver.index()].push(card);
     }
-    round.tribute.as_mut().expect("tribute still exists").stage = TributeStage::Returning;
+    tribute.stage = TributeStage::Returning;
     Ok(())
 }
 
@@ -356,10 +333,8 @@ pub fn submit_tribute(round: &mut RoundState, seat: Seat, card_id: &str) -> Resu
     let tribute = round
         .tribute
         .as_ref()
+        .filter(|tribute| tribute.stage == TributeStage::Giving)
         .ok_or_else(|| RuleError::new("INVALID_TRIBUTE_STAGE", "当前不接受贡牌"))?;
-    if tribute.stage != TributeStage::Giving {
-        return Err(RuleError::new("INVALID_TRIBUTE_STAGE", "当前不接受贡牌"));
-    }
     if !tribute.givers.contains(&seat) {
         return Err(RuleError::new("NOT_TRIBUTE_GIVER", "该玩家无需贡牌"));
     }
@@ -384,26 +359,22 @@ pub fn submit_tribute(round: &mut RoundState, seat: Seat, card_id: &str) -> Resu
 
     let tribute = round.tribute.as_mut().expect("tribute was validated");
     tribute.contributions.insert(seat, card);
-    let all_given = tribute.contributions.len() == tribute.givers.len();
-    if all_given {
+    if tribute.contributions.len() == tribute.givers.len() {
         finalize_contributions(round)?;
     }
     Ok(())
 }
 
 fn can_return_card(hand: &[Card], selected: &Card, level_rank: OrdinaryRank) -> bool {
-    let low_cards = hand
-        .iter()
-        .filter(|card| {
-            card.suit != super::types::Suit::Joker
-                && card
-                    .rank
-                    .as_ordinary()
-                    .is_some_and(|rank| ordinary_rank_value(rank) <= 10)
-        })
-        .collect::<Vec<_>>();
-    if !low_cards.is_empty() {
-        return low_cards.iter().any(|card| card.id == selected.id);
+    let is_low_card = |card: &Card| {
+        card.suit != super::types::Suit::Joker
+            && card
+                .rank
+                .as_ordinary()
+                .is_some_and(|rank| ordinary_rank_value(rank) <= 10)
+    };
+    if hand.iter().any(&is_low_card) {
+        return is_low_card(selected);
     }
 
     hand.iter()
@@ -421,10 +392,8 @@ pub fn submit_return(
     let tribute = round
         .tribute
         .as_ref()
+        .filter(|tribute| tribute.stage == TributeStage::Returning)
         .ok_or_else(|| RuleError::new("INVALID_TRIBUTE_STAGE", "当前不接受还牌"))?;
-    if tribute.stage != TributeStage::Returning {
-        return Err(RuleError::new("INVALID_TRIBUTE_STAGE", "当前不接受还牌"));
-    }
     if !tribute
         .receiver_for_giver
         .values()
@@ -444,40 +413,28 @@ pub fn submit_return(
         ));
     }
 
-    round
-        .tribute
-        .as_mut()
-        .expect("tribute was validated")
-        .returns
-        .insert(seat, card);
-
-    let complete = {
-        let tribute = round.tribute.as_ref().expect("tribute exists");
-        tribute.returns.len() == tribute.receiver_for_giver.len()
-    };
-    if !complete {
+    let tribute = round.tribute.as_mut().expect("tribute was validated");
+    tribute.returns.insert(seat, card);
+    if tribute.returns.len() != tribute.receiver_for_giver.len() {
         return Ok(None);
     }
 
-    let (transfers, leader_seat, completed_tribute) = {
-        let tribute = round.tribute.as_ref().expect("tribute exists");
-        let transfers = tribute
-            .receiver_for_giver
-            .iter()
-            .map(|(giver, receiver)| {
-                tribute
-                    .returns
-                    .get(receiver)
-                    .cloned()
-                    .map(|card| (*giver, *receiver, card))
-                    .ok_or_else(|| RuleError::internal("Missing return card"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let leader = tribute
-            .leader_seat
-            .ok_or_else(|| RuleError::internal("Tribute leader was not assigned"))?;
-        (transfers, leader, tribute.clone())
-    };
+    let transfers = tribute
+        .receiver_for_giver
+        .iter()
+        .map(|(giver, receiver)| {
+            tribute
+                .returns
+                .get(receiver)
+                .cloned()
+                .map(|card| (*giver, *receiver, card))
+                .ok_or_else(|| RuleError::internal("Missing return card"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let leader_seat = tribute
+        .leader_seat
+        .ok_or_else(|| RuleError::internal("Tribute leader was not assigned"))?;
+    let completed_tribute = tribute.clone();
 
     for (giver, receiver, returned) in transfers {
         remove_one_card(&mut round.hands[receiver.index()], &returned.id);
@@ -616,54 +573,29 @@ pub fn pass_turn(round: &mut RoundState, seat: Seat) -> Result<(), RuleError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
-    use crate::domain::types::{OrdinarySuit, Suit};
-
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-    fn card(rank: CardRank) -> Card {
-        suited_card(rank, Suit::Spade)
-    }
-
-    fn suited_card(rank: CardRank, suit: Suit) -> Card {
-        Card {
-            id: format!("round-card-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
-            deck_index: 0,
-            rank,
-            suit: if matches!(rank, CardRank::SmallJoker | CardRank::BigJoker) {
-                Suit::Joker
-            } else {
-                suit
-            },
-        }
-    }
-
-    fn simple_round(level_rank: OrdinaryRank) -> RoundState {
-        RoundState {
-            number: 1,
-            level_rank,
-            level_owner_team: None,
-            phase: RoundPhase::Playing,
-            hands: [
-                vec![card(CardRank::Three)],
-                vec![card(CardRank::Four), card(CardRank::Eight)],
-                vec![card(CardRank::Five)],
-                vec![card(CardRank::Six), card(CardRank::Nine)],
-            ],
-            active_seats: Seat::all().into_iter().collect(),
-            turn_seat: Seat::ZERO,
-            current_play: None,
-            consecutive_passes: 0,
-            finish_order: Vec::new(),
-            tribute: None,
-        }
-    }
+    use crate::domain::{
+        test_support::{card as suited_card, simple_round, spade as card},
+        types::Suit,
+    };
 
     fn play_only_card(round: &mut RoundState, seat: Seat) -> Option<RoundResult> {
         let card_id = round.hands[seat.index()][0].id.clone();
         play_cards(round, seat, &[card_id], None).unwrap()
+    }
+
+    fn single_tribute_state() -> TributeState {
+        TributeState {
+            kind: TributeKind::Single,
+            stage: TributeStage::Giving,
+            previous_first: Seat::ZERO,
+            previous_second: None,
+            givers: vec![Seat::THREE],
+            contributions: IndexMap::new(),
+            receiver_for_giver: IndexMap::from_iter([(Seat::THREE, Seat::ZERO)]),
+            returns: IndexMap::new(),
+            leader_seat: Some(Seat::THREE),
+        }
     }
 
     #[test]
@@ -702,17 +634,7 @@ mod tests {
             vec![tribute_card.clone(), card(CardRank::Ten)],
         ];
         round.phase = RoundPhase::Tribute;
-        round.tribute = Some(TributeState {
-            kind: TributeKind::Single,
-            stage: TributeStage::Giving,
-            previous_first: Seat::ZERO,
-            previous_second: None,
-            givers: vec![Seat::THREE],
-            contributions: IndexMap::new(),
-            receiver_for_giver: IndexMap::from_iter([(Seat::THREE, Seat::ZERO)]),
-            returns: IndexMap::new(),
-            leader_seat: Some(Seat::THREE),
-        });
+        round.tribute = Some(single_tribute_state());
 
         submit_tribute(&mut round, Seat::THREE, &tribute_card.id).unwrap();
         assert_eq!(
@@ -771,30 +693,15 @@ mod tests {
         let mut round = simple_round(OrdinaryRank::Seven);
         round.phase = RoundPhase::Tribute;
         round.hands[3] = vec![wildcard.clone(), king.clone(), ace.clone()];
-        round.tribute = Some(TributeState {
-            kind: TributeKind::Single,
-            stage: TributeStage::Giving,
-            previous_first: Seat::ZERO,
-            previous_second: None,
-            givers: vec![Seat::THREE],
-            contributions: IndexMap::new(),
-            receiver_for_giver: IndexMap::from_iter([(Seat::THREE, Seat::ZERO)]),
-            returns: IndexMap::new(),
-            leader_seat: Some(Seat::THREE),
-        });
+        round.tribute = Some(single_tribute_state());
 
-        assert_eq!(
-            submit_tribute(&mut round, Seat::THREE, &wildcard.id)
-                .unwrap_err()
-                .code,
-            "WILDCARD_CANNOT_BE_TRIBUTE"
-        );
-        assert_eq!(
-            submit_tribute(&mut round, Seat::THREE, &king.id)
-                .unwrap_err()
-                .code,
-            "TRIBUTE_NOT_MAXIMUM"
-        );
+        for (card, expected) in [
+            (&wildcard, "WILDCARD_CANNOT_BE_TRIBUTE"),
+            (&king, "TRIBUTE_NOT_MAXIMUM"),
+        ] {
+            let error = submit_tribute(&mut round, Seat::THREE, &card.id).unwrap_err();
+            assert_eq!(error.code, expected);
+        }
     }
 
     #[test]
@@ -835,40 +742,24 @@ mod tests {
     #[test]
     fn cannot_pass_when_leading_or_play_out_of_turn() {
         let mut round = simple_round(OrdinaryRank::Seven);
-        assert_eq!(
-            pass_turn(&mut round, Seat::ZERO).unwrap_err().code,
-            "CANNOT_PASS_WHEN_LEADING"
-        );
+        let error = pass_turn(&mut round, Seat::ZERO).unwrap_err();
+        assert_eq!(error.code, "CANNOT_PASS_WHEN_LEADING");
         let card_id = round.hands[1][0].id.clone();
-        assert_eq!(
-            play_cards(&mut round, Seat::ONE, &[card_id], None)
-                .unwrap_err()
-                .code,
-            "NOT_YOUR_TURN"
-        );
+        let error = play_cards(&mut round, Seat::ONE, &[card_id], None).unwrap_err();
+        assert_eq!(error.code, "NOT_YOUR_TURN");
     }
 
     #[test]
     fn low_return_cards_are_natural_ranks_not_effective_strength() {
         let low_level = suited_card(CardRank::Seven, Suit::Heart);
         let ace = card(CardRank::Ace);
-        assert!(can_return_card(
-            &[low_level.clone(), ace.clone()],
-            &low_level,
-            OrdinaryRank::Seven
-        ));
-        assert!(!can_return_card(
-            &[low_level, ace.clone()],
-            &ace,
-            OrdinaryRank::Seven
-        ));
+        let can_return =
+            |hand: &[Card], candidate: &Card| can_return_card(hand, candidate, OrdinaryRank::Seven);
+        assert!(can_return(&[low_level.clone(), ace.clone()], &low_level));
+        assert!(!can_return(&[low_level, ace.clone()], &ace));
 
         let king = card(CardRank::King);
-        assert!(can_return_card(
-            &[king.clone(), ace],
-            &king,
-            OrdinaryRank::Seven
-        ));
+        assert!(can_return(&[king.clone(), ace], &king));
     }
 
     #[test]
@@ -891,13 +782,5 @@ mod tests {
         assert_eq!(calls.last(), Some(&4));
         assert_eq!(round.turn_seat, Seat::ZERO);
         assert!(round.hands.iter().all(|hand| hand.len() == 27));
-    }
-
-    #[test]
-    fn ordinary_suit_import_remains_wire_compatible() {
-        assert_eq!(
-            serde_json::to_string(&OrdinarySuit::Heart).unwrap(),
-            "\"heart\""
-        );
     }
 }

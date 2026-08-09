@@ -23,17 +23,16 @@ use uuid::Uuid;
 use crate::{
     domain::{
         errors::RuleError,
-        types::{CardRank, CombinationDeclaration, CombinationKind, OrdinaryRank, Seat},
+        types::{CombinationDeclaration, Seat, deserialize_optional_non_null},
     },
     rooms::{
         room_service::RoomService,
-        types::{CommandResult, PublicationMessage, RoomState},
+        types::{CommandContext, CommandResult, PublicationMessage, RoomState},
     },
     transport::http::{
-        ErrorPayload, internal_error_payload, invalid_message, rule_error_payload,
-        validated_socket_room_code,
+        internal_error_payload, invalid_message, rule_error_payload, validated_socket_room_code,
     },
-    transport::{client_ip::client_ip, utf16_len},
+    transport::{client_ip::client_ip, rate_limit::RateWindow, utf16_len},
     views::room_view::create_room_view,
 };
 
@@ -51,13 +50,6 @@ struct SocketIdentity {
     room_instance_id: Uuid,
     participant_id: String,
     reconnect_token: String,
-}
-
-#[derive(Debug)]
-struct RateWindow {
-    started_at: Instant,
-    last_seen: Instant,
-    count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -92,12 +84,10 @@ impl SocketRateRegistry {
         let now = Instant::now();
         let mut states = self.0.lock();
         states.identities.retain(|_, state| {
-            Arc::strong_count(state) > 1
-                || now.duration_since(state.lock().last_seen) < RATE_STATE_RETENTION
+            Arc::strong_count(state) > 1 || !state.lock().is_idle(now, RATE_STATE_RETENTION)
         });
         states.rooms.retain(|_, state| {
-            Arc::strong_count(state) > 1
-                || now.duration_since(state.lock().last_seen) < RATE_STATE_RETENTION
+            Arc::strong_count(state) > 1 || !state.lock().is_idle(now, RATE_STATE_RETENTION)
         });
         let key = format!("{}:{participant_id}", room_instance_id.simple());
         let identity = Arc::clone(
@@ -112,8 +102,8 @@ impl SocketRateRegistry {
                 .entry(room_instance_id)
                 .or_insert_with(|| new_rate_window(now)),
         );
-        identity.lock().last_seen = now;
-        room.lock().last_seen = now;
+        identity.lock().touch(now);
+        room.lock().touch(now);
         SocketRateState {
             identity,
             room,
@@ -123,11 +113,7 @@ impl SocketRateRegistry {
 }
 
 fn new_rate_window(now: Instant) -> Arc<Mutex<RateWindow>> {
-    Arc::new(Mutex::new(RateWindow {
-        started_at: now,
-        last_seen: now,
-        count: 0,
-    }))
+    Arc::new(Mutex::new(RateWindow::new(now)))
 }
 
 #[derive(Clone, Default)]
@@ -137,19 +123,12 @@ impl HandshakeRateRegistry {
     fn consume(&self, peer_ip: Option<IpAddr>) -> Result<(), ConnectRefusal> {
         let now = Instant::now();
         let mut states = self.0.lock();
-        states.retain(|_, state| now.duration_since(state.last_seen) < RATE_STATE_RETENTION);
-        let state = states.entry(peer_ip).or_insert(RateWindow {
-            started_at: now,
-            last_seen: now,
-            count: 0,
-        });
-        if now.duration_since(state.started_at) >= HANDSHAKE_RATE_WINDOW {
-            state.started_at = now;
-            state.count = 0;
-        }
-        state.last_seen = now;
-        state.count = state.count.saturating_add(1);
-        if state.count > HANDSHAKE_RATE_MAX {
+        states.retain(|_, state| !state.is_idle(now, RATE_STATE_RETENTION));
+        let limited = states
+            .entry(peer_ip)
+            .or_insert_with(|| RateWindow::new(now))
+            .consume(now, HANDSHAKE_RATE_WINDOW, HANDSHAKE_RATE_MAX);
+        if limited {
             return Err(ConnectRefusal(rule_error_payload(RuleError::new(
                 "RATE_LIMITED",
                 "连接尝试过于频繁，请稍后重试",
@@ -167,128 +146,79 @@ struct SocketAuth {
     reconnect_token: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReadyPayload {
-    action_id: String,
-    version: u64,
-    ready: bool,
-}
+trait CommandPayload: Sized {
+    fn action_id(&self) -> &str;
+    fn version(&self) -> u64;
+    fn validate_data(&self) -> Result<(), RuleError> {
+        Ok(())
+    }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ChangeSeatPayload {
-    action_id: String,
-    version: u64,
-    seat: Seat,
-}
+    fn validate(self) -> Result<Self, RuleError> {
+        validate_action_id(self.action_id())?;
+        self.validate_data()?;
+        Ok(self)
+    }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SimpleActionPayload {
-    action_id: String,
-    version: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DeclarationPayload {
-    kind: CombinationKind,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    primary_rank: Option<CardRank>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    sequence_top: Option<OrdinaryRank>,
-}
-
-impl From<DeclarationPayload> for CombinationDeclaration {
-    fn from(value: DeclarationPayload) -> Self {
-        Self {
-            kind: value.kind,
-            primary_rank: value.primary_rank,
-            sequence_top: value.sequence_top,
+    fn context<'a>(&'a self, identity: &'a SocketIdentity) -> CommandContext<'a> {
+        CommandContext {
+            room_code: &identity.room_code,
+            participant_id: &identity.participant_id,
+            action_id: self.action_id(),
+            expected_version: self.version(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PlayCardsPayload {
-    action_id: String,
-    version: u64,
+macro_rules! command_payload {
+    ($name:ident { $($(#[$attribute:meta])* $field:ident: $type:ty),* $(,)? }
+        $(, |$this:ident| $validation:block)?) => {
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct $name {
+            action_id: String,
+            version: u64,
+            $($(#[$attribute])* $field: $type),*
+        }
+
+        impl CommandPayload for $name {
+            fn action_id(&self) -> &str {
+                &self.action_id
+            }
+            fn version(&self) -> u64 {
+                self.version
+            }
+            $(fn validate_data(&self) -> Result<(), RuleError> {
+                let $this = self;
+                $validation
+            })?
+        }
+    };
+}
+
+command_payload!(ReadyPayload { ready: bool });
+command_payload!(ChangeSeatPayload { seat: Seat });
+command_payload!(SimpleActionPayload {});
+command_payload!(PlayCardsPayload {
     card_ids: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    declaration: Option<DeclarationPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CardActionPayload {
-    action_id: String,
-    version: u64,
-    card_id: String,
-}
-
-trait ValidatePayload: Sized {
-    fn validate(self) -> Result<Self, ErrorPayload>;
-}
-
-/// Serde normally treats an explicit JSON `null` like an omitted `Option`.
-/// Zod's `.optional()` did not: a present field still had to contain the
-/// declared value type. Keep that distinction at the wire boundary.
-fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
-impl ValidatePayload for ReadyPayload {
-    fn validate(self) -> Result<Self, ErrorPayload> {
-        validate_action_id(&self.action_id)?;
-        Ok(self)
+    declaration: Option<CombinationDeclaration>,
+}, |payload| {
+    if !(1..=10).contains(&payload.card_ids.len()) {
+        return Err(invalid_message("cardIds must contain 1 to 10 cards"));
     }
-}
-
-impl ValidatePayload for ChangeSeatPayload {
-    fn validate(self) -> Result<Self, ErrorPayload> {
-        validate_action_id(&self.action_id)?;
-        Ok(self)
+    for card_id in &payload.card_ids {
+        validate_card_id(card_id)?;
     }
-}
-
-impl ValidatePayload for SimpleActionPayload {
-    fn validate(self) -> Result<Self, ErrorPayload> {
-        validate_action_id(&self.action_id)?;
-        Ok(self)
-    }
-}
-
-impl ValidatePayload for PlayCardsPayload {
-    fn validate(self) -> Result<Self, ErrorPayload> {
-        validate_action_id(&self.action_id)?;
-        if !(1..=10).contains(&self.card_ids.len()) {
-            return Err(invalid_message("cardIds must contain 1 to 10 cards"));
-        }
-        for card_id in &self.card_ids {
-            validate_card_id(card_id)?;
-        }
-        Ok(self)
-    }
-}
-
-impl ValidatePayload for CardActionPayload {
-    fn validate(self) -> Result<Self, ErrorPayload> {
-        validate_action_id(&self.action_id)?;
-        validate_card_id(&self.card_id)?;
-        Ok(self)
-    }
-}
+    Ok(())
+});
+command_payload!(CardActionPayload { card_id: String }, |payload| {
+    validate_card_id(&payload.card_id)
+});
 
 #[derive(Debug, Serialize)]
 struct ErrorAck {
     ok: bool,
-    error: ErrorPayload,
+    error: RuleError,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,7 +237,7 @@ struct SyncAck {
 }
 
 #[derive(Debug)]
-struct ConnectRefusal(ErrorPayload);
+struct ConnectRefusal(RuleError);
 
 impl fmt::Display for ConnectRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -431,7 +361,7 @@ fn handle_connection(socket: SocketRef, rooms: RoomService) {
 
     // Join before committing the connection so the commit-ordered initial
     // snapshot includes this socket in its target set.
-    socket.join(identity_channel(&identity));
+    socket.join(room_channel(&identity.room_code, identity.room_instance_id));
 
     let socket_id = socket.id.to_string();
     let room = match rooms.connect_socket(
@@ -453,6 +383,21 @@ fn handle_connection(socket: SocketRef, rooms: RoomService) {
     }
 }
 
+macro_rules! register_command_handlers {
+    ($socket:expr, $rooms:expr; $(
+        $event:literal, $payload:ty => |$service:ident, $command:ident, $body:ident| $operation:expr
+    ),+ $(,)?) => {
+        $(
+            register_command_handler::<$payload, _>(
+                $socket,
+                $rooms,
+                $event,
+                |$service, $command, $body| $operation,
+            );
+        )+
+    };
+}
+
 fn register_message_handlers(socket: &SocketRef, rooms: &RoomService) {
     let sync_rooms = rooms.clone();
     socket.on("room.sync", move |socket: SocketRef, ack: AckSender| {
@@ -460,134 +405,33 @@ fn register_message_handlers(socket: &SocketRef, rooms: &RoomService) {
         async move { handle_sync(socket, ack, rooms).await }
     });
 
-    register_command_handler::<ReadyPayload, _>(
-        socket,
-        rooms,
-        "room.ready",
-        |rooms, identity, payload| {
-            rooms.set_ready(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-                payload.ready,
-            )
+    register_command_handlers!(socket, rooms;
+        "room.ready", ReadyPayload => |rooms, command, payload| {
+            rooms.set_ready(command, payload.ready)
         },
-    );
-
-    register_command_handler::<ChangeSeatPayload, _>(
-        socket,
-        rooms,
-        "room.change_seat",
-        |rooms, identity, payload| {
-            rooms.change_seat(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-                payload.seat,
-            )
+        "room.change_seat", ChangeSeatPayload => |rooms, command, payload| {
+            rooms.change_seat(command, payload.seat)
         },
-    );
-
-    register_command_handler::<SimpleActionPayload, _>(
-        socket,
-        rooms,
-        "match.start",
-        |rooms, identity, payload| {
-            rooms.start_match(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-            )
+        "match.start", SimpleActionPayload => |rooms, command, _payload| {
+            rooms.start_match(command)
         },
-    );
-
-    register_command_handler::<PlayCardsPayload, _>(
-        socket,
-        rooms,
-        "round.play",
-        |rooms, identity, payload| {
-            let declaration = payload.declaration.map(CombinationDeclaration::from);
-            rooms.play_cards(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-                &payload.card_ids,
-                declaration.as_ref(),
-            )
+        "round.play", PlayCardsPayload => |rooms, command, payload| {
+            rooms.play_cards(command, &payload.card_ids, payload.declaration.as_ref())
         },
-    );
-
-    register_command_handler::<SimpleActionPayload, _>(
-        socket,
-        rooms,
-        "round.pass",
-        |rooms, identity, payload| {
-            rooms.pass(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-            )
+        "round.pass", SimpleActionPayload => |rooms, command, _payload| {
+            rooms.pass(command)
         },
-    );
-    register_command_handler::<SimpleActionPayload, _>(
-        socket,
-        rooms,
-        "round.next",
-        |rooms, identity, payload| {
-            rooms.start_next_round(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-            )
+        "round.next", SimpleActionPayload => |rooms, command, _payload| {
+            rooms.start_next_round(command)
         },
-    );
-    register_command_handler::<SimpleActionPayload, _>(
-        socket,
-        rooms,
-        "match.abort",
-        |rooms, identity, payload| {
-            rooms.abort_match(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-            )
+        "match.abort", SimpleActionPayload => |rooms, command, _payload| {
+            rooms.abort_match(command)
         },
-    );
-
-    register_command_handler::<CardActionPayload, _>(
-        socket,
-        rooms,
-        "tribute.give",
-        |rooms, identity, payload| {
-            rooms.give_tribute(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-                &payload.card_id,
-            )
+        "tribute.give", CardActionPayload => |rooms, command, payload| {
+            rooms.give_tribute(command, &payload.card_id)
         },
-    );
-
-    register_command_handler::<CardActionPayload, _>(
-        socket,
-        rooms,
-        "tribute.return",
-        |rooms, identity, payload| {
-            rooms.return_tribute(
-                &identity.room_code,
-                &identity.participant_id,
-                &payload.action_id,
-                payload.version,
-                &payload.card_id,
-            )
+        "tribute.return", CardActionPayload => |rooms, command, payload| {
+            rooms.return_tribute(command, &payload.card_id)
         },
     );
 }
@@ -598,8 +442,8 @@ fn register_command_handler<T, F>(
     event: &'static str,
     operation: F,
 ) where
-    T: DeserializeOwned + ValidatePayload + Send + Sync + 'static,
-    F: Fn(&RoomService, &SocketIdentity, T) -> Result<CommandResult, RuleError>
+    T: DeserializeOwned + CommandPayload + Send + Sync + 'static,
+    F: for<'a> Fn(&RoomService, CommandContext<'a>, &'a T) -> Result<CommandResult, RuleError>
         + Clone
         + Send
         + Sync
@@ -670,8 +514,8 @@ async fn handle_command<T, F>(
     payload: Result<T, ParserError>,
     operation: F,
 ) where
-    T: ValidatePayload,
-    F: FnOnce(&RoomService, &SocketIdentity, T) -> Result<CommandResult, RuleError>,
+    T: CommandPayload,
+    F: for<'a> FnOnce(&RoomService, CommandContext<'a>, &'a T) -> Result<CommandResult, RuleError>,
 {
     if let Err(error) = consume_rate_limit(&socket) {
         send_error_ack(ack, error);
@@ -695,8 +539,9 @@ async fn handle_command<T, F>(
         return;
     };
     let identity = identity.clone();
+    let command = payload.context(&identity);
 
-    match operation(&rooms, &identity, payload) {
+    match operation(&rooms, command, &payload) {
         Ok(result) => {
             if result.publication.await.is_err() {
                 send_error_ack(ack, internal_error_payload());
@@ -736,7 +581,7 @@ async fn dispatch_publications(io: SocketIo, mut publications: mpsc::Receiver<Pu
                 events,
                 completed,
             } => {
-                let channel = room_channel(&room);
+                let channel = room_channel(&room.code, room.instance_id);
                 for event in events {
                     if let Err(error) = io
                         .to(channel.clone())
@@ -751,21 +596,14 @@ async fn dispatch_publications(io: SocketIo, mut publications: mpsc::Receiver<Pu
                     }
                 }
                 broadcast_snapshots(&io, &room);
-                if let Some(completed) = completed {
-                    let _ = completed.send(());
-                }
+                let _ = completed.send(());
             }
-            PublicationMessage::Barrier {
-                room: _,
-                ready,
-                release,
-            } => {
-                if ready.send(()).is_ok() {
+            PublicationMessage::Fence { ready, release } => {
+                if ready.send(()).is_ok()
+                    && let Some(release) = release
+                {
                     let _ = release.await;
                 }
-            }
-            PublicationMessage::Flush { completed } => {
-                let _ = completed.send(());
             }
         }
     }
@@ -773,7 +611,7 @@ async fn dispatch_publications(io: SocketIo, mut publications: mpsc::Receiver<Pu
 
 fn broadcast_snapshots(io: &SocketIo, room: &RoomState) {
     let mut snapshots = HashMap::<String, Value>::new();
-    for socket in io.to(room_channel(room)).sockets() {
+    for socket in io.to(room_channel(&room.code, room.instance_id)).sockets() {
         let Some(identity) = socket.extensions.get::<SocketIdentity>() else {
             continue;
         };
@@ -789,29 +627,24 @@ fn broadcast_snapshots(io: &SocketIo, room: &RoomState) {
     }
 }
 
-fn consume_rate_limit(socket: &SocketRef) -> Result<(), ErrorPayload> {
+fn consume_rate_limit(socket: &SocketRef) -> Result<(), RuleError> {
     let Some(rate_state) = socket.extensions.get::<SocketRateState>() else {
         return Err(internal_error_payload());
     };
     consume_rate_state(&rate_state)
 }
 
-fn consume_rate_state(rate_state: &SocketRateState) -> Result<(), ErrorPayload> {
+fn consume_rate_state(rate_state: &SocketRateState) -> Result<(), RuleError> {
     consume_rate_window(&rate_state.identity, SOCKET_RATE_MAX)?;
     consume_rate_window(&rate_state.room, ROOM_RATE_MAX)?;
     consume_rate_window(&rate_state.global, GLOBAL_RATE_MAX)
 }
 
-fn consume_rate_window(rate_window: &Mutex<RateWindow>, maximum: u32) -> Result<(), ErrorPayload> {
-    let now = Instant::now();
-    let mut window = rate_window.lock();
-    if now.duration_since(window.started_at) >= SOCKET_RATE_WINDOW {
-        window.started_at = now;
-        window.count = 0;
-    }
-    window.last_seen = now;
-    window.count = window.count.saturating_add(1);
-    if window.count > maximum {
+fn consume_rate_window(rate_window: &Mutex<RateWindow>, maximum: u32) -> Result<(), RuleError> {
+    if rate_window
+        .lock()
+        .consume(Instant::now(), SOCKET_RATE_WINDOW, maximum)
+    {
         return Err(rule_error_payload(RuleError::new(
             "RATE_LIMITED",
             "操作过于频繁，请稍后重试",
@@ -820,84 +653,60 @@ fn consume_rate_window(rate_window: &Mutex<RateWindow>, maximum: u32) -> Result<
     Ok(())
 }
 
-fn send_error_ack(ack: AckSender, error: ErrorPayload) {
+fn send_error_ack(ack: AckSender, error: RuleError) {
     if let Err(send_error) = ack.send(&ErrorAck { ok: false, error }) {
         tracing::debug!(%send_error, "failed to acknowledge socket error");
     }
 }
 
-fn validate_action_id(value: &str) -> Result<(), ErrorPayload> {
+fn validate_action_id(value: &str) -> Result<(), RuleError> {
     if !(8..=128).contains(&utf16_len(value)) {
         return Err(invalid_message("actionId must contain 8 to 128 characters"));
     }
     Ok(())
 }
 
-fn validate_card_id(value: &str) -> Result<(), ErrorPayload> {
+fn validate_card_id(value: &str) -> Result<(), RuleError> {
     if !(1..=80).contains(&utf16_len(value)) {
         return Err(invalid_message("cardId must contain 1 to 80 characters"));
     }
     Ok(())
 }
 
-fn room_channel(room: &RoomState) -> String {
-    format!("room:{}:{}", room.code, room.instance_id.simple())
-}
-
-fn identity_channel(identity: &SocketIdentity) -> String {
-    format!(
-        "room:{}:{}",
-        identity.room_code,
-        identity.room_instance_id.simple()
-    )
+fn room_channel(code: &str, instance_id: Uuid) -> String {
+    format!("room:{}:{}", code, instance_id.simple())
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
     #[test]
     fn optional_command_fields_reject_explicit_null() {
-        let base = json!({
+        let mut play_payload = json!({
             "actionId": "action-01",
             "version": 1,
             "cardIds": ["0:spade:3"]
         });
-        assert!(serde_json::from_value::<PlayCardsPayload>(base).is_ok());
-        assert!(
-            serde_json::from_value::<PlayCardsPayload>(json!({
-                "actionId": "action-01",
-                "version": 1,
-                "cardIds": ["0:spade:3"],
-                "declaration": null
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<DeclarationPayload>(json!({
-                "kind": "single",
-                "primaryRank": null
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<ChangeSeatPayload>(json!({
-                "actionId": "action-01",
-                "version": 1,
-                "seat": 3
-            }))
-            .is_ok()
-        );
-        assert!(
-            serde_json::from_value::<ChangeSeatPayload>(json!({
-                "actionId": "action-01",
-                "version": 1,
-                "seat": 4
-            }))
-            .is_err()
-        );
+        assert!(serde_json::from_value::<PlayCardsPayload>(play_payload.clone()).is_ok());
+        play_payload["declaration"] = Value::Null;
+        assert!(serde_json::from_value::<PlayCardsPayload>(play_payload).is_err());
+
+        let mut declaration = json!({ "kind": "single" });
+        assert!(serde_json::from_value::<CombinationDeclaration>(declaration.clone()).is_ok());
+        declaration["primaryRank"] = Value::Null;
+        assert!(serde_json::from_value::<CombinationDeclaration>(declaration).is_err());
+
+        let mut seat_payload = json!({
+            "actionId": "action-01",
+            "version": 1,
+            "seat": 3
+        });
+        assert!(serde_json::from_value::<ChangeSeatPayload>(seat_payload.clone()).is_ok());
+        seat_payload["seat"] = Value::from(4);
+        assert!(serde_json::from_value::<ChangeSeatPayload>(seat_payload).is_err());
     }
 
     #[test]
@@ -906,8 +715,8 @@ mod tests {
         let room_instance_id = Uuid::new_v4();
         let first_socket = registry.state_for(room_instance_id, "participant-1");
         let expired = Instant::now() - RATE_STATE_RETENTION - Duration::from_secs(1);
-        first_socket.identity.lock().last_seen = expired;
-        first_socket.room.lock().last_seen = expired;
+        first_socket.identity.lock().touch(expired);
+        first_socket.room.lock().touch(expired);
 
         let reconnect = registry.state_for(room_instance_id, "participant-1");
 

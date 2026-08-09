@@ -1,65 +1,36 @@
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
-use serde_json::{Map, Value};
+use serde_json::json;
 
 use super::cards::{card_rank_strength, is_wildcard, ordinary_rank_value};
 use super::errors::RuleError;
 use super::types::{
     Card, CardRank, Combination, CombinationDeclaration, CombinationKind, ORDINARY_RANKS,
-    OrdinaryRank, OrdinarySuit, Suit, WildcardAssignment,
+    ORDINARY_SUITS, OrdinaryRank, OrdinarySuit, Suit, WildcardAssignment,
 };
 
-const ORDINARY_SUITS: [OrdinarySuit; 4] = [
-    OrdinarySuit::Heart,
-    OrdinarySuit::Diamond,
-    OrdinarySuit::Club,
-    OrdinarySuit::Spade,
-];
-
-#[derive(Clone)]
 struct VirtualCard {
     rank: CardRank,
     suit: Suit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SemanticKey {
-    kind: CombinationKind,
-    size: usize,
-    primary_rank: Option<CardRank>,
-    sequence_top: Option<OrdinaryRank>,
-    suit: Option<OrdinarySuit>,
-}
+type SemanticKey = (
+    CombinationKind,
+    usize,
+    Option<CardRank>,
+    Option<OrdinaryRank>,
+    Option<OrdinarySuit>,
+);
 
-impl From<&Combination> for SemanticKey {
-    fn from(combination: &Combination) -> Self {
-        Self {
-            kind: combination.kind,
-            size: combination.size,
-            primary_rank: combination.primary_rank,
-            sequence_top: combination.sequence_top,
-            suit: combination.suit,
-        }
-    }
-}
-
-fn sequence_patterns(length: usize) -> Vec<Vec<OrdinaryRank>> {
-    let mut patterns = Vec::new();
-    let mut low_ace = Vec::with_capacity(length);
-    low_ace.push(OrdinaryRank::Ace);
-    low_ace.extend(
-        ORDINARY_RANKS
-            .iter()
-            .copied()
-            .take(length.saturating_sub(1)),
-    );
-    patterns.push(low_ace);
-
-    for start in 0..=ORDINARY_RANKS.len() - length {
-        patterns.push(ORDINARY_RANKS[start..start + length].to_vec());
-    }
-    patterns
+fn semantic_key(combination: &Combination) -> SemanticKey {
+    (
+        combination.kind,
+        combination.size,
+        combination.primary_rank,
+        combination.sequence_top,
+        combination.suit,
+    )
 }
 
 fn count_ranks(cards: &[VirtualCard]) -> IndexMap<CardRank, usize> {
@@ -75,35 +46,23 @@ fn find_sequence_top(
     sequence_length: usize,
     copies_per_rank: usize,
 ) -> Option<OrdinaryRank> {
-    for pattern in sequence_patterns(sequence_length) {
-        if counts.len() == sequence_length
-            && pattern
-                .iter()
-                .all(|rank| counts.get(&CardRank::from(*rank)).copied() == Some(copies_per_rank))
-        {
-            return pattern.last().copied();
-        }
+    if counts.len() != sequence_length {
+        return None;
     }
-    None
-}
-
-fn add_combination(
-    combinations: &mut Vec<Combination>,
-    wildcard_assignments: &IndexMap<String, WildcardAssignment>,
-    kind: CombinationKind,
-    size: usize,
-    primary_rank: Option<CardRank>,
-    sequence_top: Option<OrdinaryRank>,
-    suit: Option<OrdinarySuit>,
-) {
-    combinations.push(Combination {
-        kind,
-        size,
-        primary_rank,
-        sequence_top,
-        suit,
-        wildcard_assignments: wildcard_assignments.clone(),
-    });
+    let has_copies = |rank| counts.get(&CardRank::from(rank)).copied() == Some(copies_per_rank);
+    if has_copies(OrdinaryRank::Ace)
+        && ORDINARY_RANKS[..sequence_length - 1]
+            .iter()
+            .copied()
+            .all(&has_copies)
+    {
+        return Some(ORDINARY_RANKS[sequence_length - 2]);
+    }
+    ORDINARY_RANKS
+        .windows(sequence_length)
+        .find(|pattern| pattern.iter().copied().all(&has_copies))
+        .and_then(|pattern| pattern.last())
+        .copied()
 }
 
 fn classify_resolved(
@@ -114,129 +73,75 @@ fn classify_resolved(
     let counts = count_ranks(cards);
     let size = cards.len();
     let ordinary_only = cards.iter().all(|card| card.suit != Suit::Joker);
-
-    if size == 1
-        && let Some(card) = cards.first()
-    {
-        add_combination(
-            &mut combinations,
-            wildcard_assignments,
-            CombinationKind::Single,
+    let first_rank = cards.first().map(|card| card.rank);
+    let mut add = |kind, primary_rank, sequence_top, suit| {
+        combinations.push(Combination {
+            kind,
             size,
-            Some(card.rank),
-            None,
-            None,
-        );
+            primary_rank,
+            sequence_top,
+            suit,
+            wildcard_assignments: wildcard_assignments.clone(),
+        });
+    };
+
+    if size == 1 {
+        add(CombinationKind::Single, first_rank, None, None);
     }
 
     if size == 2 && counts.len() == 1 {
-        add_combination(
-            &mut combinations,
-            wildcard_assignments,
-            CombinationKind::Pair,
-            size,
-            cards.first().map(|card| card.rank),
-            None,
-            None,
-        );
+        add(CombinationKind::Pair, first_rank, None, None);
     }
 
     if size == 3 && ordinary_only && counts.len() == 1 {
-        add_combination(
-            &mut combinations,
-            wildcard_assignments,
-            CombinationKind::Triple,
-            size,
-            cards.first().map(|card| card.rank),
+        add(CombinationKind::Triple, first_rank, None, None);
+    }
+
+    if size == 5
+        && counts.len() == 2
+        && let Some((&rank, _)) = counts
+            .iter()
+            .find(|(rank, count)| **count == 3 && rank.as_ordinary().is_some())
+    {
+        add(CombinationKind::FullHouse, Some(rank), None, None);
+    }
+
+    if let Some(sequence_top) = find_sequence_top(&counts, 5, 1) {
+        add(CombinationKind::Straight, None, Some(sequence_top), None);
+
+        if let Some(first_suit) = cards.first().and_then(|card| card.suit.as_ordinary())
+            && cards
+                .iter()
+                .all(|card| card.suit.as_ordinary() == Some(first_suit))
+        {
+            add(
+                CombinationKind::StraightFlush,
+                None,
+                Some(sequence_top),
+                Some(first_suit),
+            );
+        }
+    }
+
+    if let Some(pair_top) = find_sequence_top(&counts, 3, 2) {
+        add(
+            CombinationKind::ConsecutivePairs,
             None,
+            Some(pair_top),
             None,
         );
     }
-
-    if size == 5 {
-        for (rank, count) in &counts {
-            if *count == 3 && rank.as_ordinary().is_some() {
-                let has_pair = counts
-                    .iter()
-                    .any(|(pair_rank, pair_count)| pair_rank != rank && *pair_count == 2);
-                if has_pair {
-                    add_combination(
-                        &mut combinations,
-                        wildcard_assignments,
-                        CombinationKind::FullHouse,
-                        size,
-                        Some(*rank),
-                        None,
-                        None,
-                    );
-                }
-            }
-        }
-
-        if ordinary_only && let Some(sequence_top) = find_sequence_top(&counts, 5, 1) {
-            add_combination(
-                &mut combinations,
-                wildcard_assignments,
-                CombinationKind::Straight,
-                size,
-                None,
-                Some(sequence_top),
-                None,
-            );
-
-            if let Some(first_suit) = cards.first().and_then(|card| card.suit.as_ordinary())
-                && cards
-                    .iter()
-                    .all(|card| card.suit.as_ordinary() == Some(first_suit))
-            {
-                add_combination(
-                    &mut combinations,
-                    wildcard_assignments,
-                    CombinationKind::StraightFlush,
-                    size,
-                    None,
-                    Some(sequence_top),
-                    Some(first_suit),
-                );
-            }
-        }
-    }
-
-    if size == 6 && ordinary_only {
-        if let Some(pair_top) = find_sequence_top(&counts, 3, 2) {
-            add_combination(
-                &mut combinations,
-                wildcard_assignments,
-                CombinationKind::ConsecutivePairs,
-                size,
-                None,
-                Some(pair_top),
-                None,
-            );
-        }
-        if let Some(triple_top) = find_sequence_top(&counts, 2, 3) {
-            add_combination(
-                &mut combinations,
-                wildcard_assignments,
-                CombinationKind::ConsecutiveTriples,
-                size,
-                None,
-                Some(triple_top),
-                None,
-            );
-        }
+    if let Some(triple_top) = find_sequence_top(&counts, 2, 3) {
+        add(
+            CombinationKind::ConsecutiveTriples,
+            None,
+            Some(triple_top),
+            None,
+        );
     }
 
     if size >= 4 && ordinary_only && counts.len() == 1 {
-        add_combination(
-            &mut combinations,
-            wildcard_assignments,
-            CombinationKind::Bomb,
-            size,
-            cards.first().map(|card| card.rank),
-            None,
-            None,
-        );
+        add(CombinationKind::Bomb, first_rank, None, None);
     }
 
     combinations
@@ -269,12 +174,7 @@ fn visit_wildcard_assignments(
         return;
     }
 
-    let Some(card) = wildcard_indexes
-        .get(wildcard_position)
-        .and_then(|index| cards.get(*index))
-    else {
-        return;
-    };
+    let card = &cards[wildcard_indexes[wildcard_position]];
 
     for rank in ORDINARY_RANKS {
         for suit in ORDINARY_SUITS {
@@ -300,19 +200,6 @@ fn enumerate_resolved_cards(
         .enumerate()
         .filter_map(|(index, card)| is_wildcard(card, level_rank).then_some(index))
         .collect::<Vec<_>>();
-
-    if wildcard_indexes.is_empty() {
-        return vec![(
-            cards
-                .iter()
-                .map(|card| VirtualCard {
-                    rank: card.rank,
-                    suit: card.suit,
-                })
-                .collect(),
-            IndexMap::new(),
-        )];
-    }
 
     let mut resolved = Vec::new();
     visit_wildcard_assignments(
@@ -371,7 +258,7 @@ pub fn list_combinations(cards: &[Card], level_rank: OrdinaryRank) -> Vec<Combin
             suit: None,
             wildcard_assignments: IndexMap::new(),
         };
-        unique.insert(SemanticKey::from(&combination), combination);
+        unique.insert(semantic_key(&combination), combination);
     }
 
     if cards.len() == 1 && is_wildcard(&cards[0], level_rank) {
@@ -383,14 +270,14 @@ pub fn list_combinations(cards: &[Card], level_rank: OrdinaryRank) -> Vec<Combin
             suit: None,
             wildcard_assignments: IndexMap::new(),
         };
-        unique.insert(SemanticKey::from(&combination), combination);
+        unique.insert(semantic_key(&combination), combination);
         return unique.into_values().collect();
     }
 
     for (resolved_cards, assignments) in enumerate_resolved_cards(cards, level_rank) {
         for combination in classify_resolved(&resolved_cards, &assignments) {
             unique
-                .entry(SemanticKey::from(&combination))
+                .entry(semantic_key(&combination))
                 .or_insert(combination);
         }
     }
@@ -404,7 +291,7 @@ pub fn resolve_combination(
     declaration: Option<&CombinationDeclaration>,
 ) -> Result<Combination, RuleError> {
     let candidates = list_combinations(cards, level_rank);
-    let matches = candidates
+    let mut matches = candidates
         .into_iter()
         .filter(|candidate| {
             declaration.is_none_or(|declaration| matches_declaration(candidate, declaration))
@@ -421,41 +308,20 @@ pub fn resolve_combination(
     if matches.len() > 1 {
         let options = matches
             .iter()
-            .map(|candidate| {
-                let mut option = Map::new();
-                option.insert(
-                    "kind".into(),
-                    serde_json::to_value(candidate.kind).expect("combination kind is serializable"),
-                );
-                if let Some(primary_rank) = candidate.primary_rank {
-                    option.insert(
-                        "primaryRank".into(),
-                        serde_json::to_value(primary_rank).expect("card rank is serializable"),
-                    );
-                }
-                if let Some(sequence_top) = candidate.sequence_top {
-                    option.insert(
-                        "sequenceTop".into(),
-                        serde_json::to_value(sequence_top).expect("ordinary rank is serializable"),
-                    );
-                }
-                Value::Object(option)
+            .map(|candidate| CombinationDeclaration {
+                kind: candidate.kind,
+                primary_rank: candidate.primary_rank,
+                sequence_top: candidate.sequence_top,
             })
-            .collect();
+            .collect::<Vec<_>>();
         return Err(RuleError::new(
             "AMBIGUOUS_COMBINATION",
             "所选牌张可以解释为多种牌型，请明确声明",
         )
-        .with_details(Value::Object(Map::from_iter([(
-            "options".into(),
-            Value::Array(options),
-        )]))));
+        .with_details(json!({ "options": options })));
     }
 
-    Ok(matches
-        .into_iter()
-        .next()
-        .expect("a single combination match exists"))
+    Ok(matches.pop().expect("a single combination match exists"))
 }
 
 pub const fn is_bomb_combination(kind: CombinationKind) -> bool {
@@ -463,10 +329,6 @@ pub const fn is_bomb_combination(kind: CombinationKind) -> bool {
         kind,
         CombinationKind::Bomb | CombinationKind::StraightFlush | CombinationKind::JokerBomb
     )
-}
-
-fn sequence_strength(rank: OrdinaryRank) -> u8 {
-    ordinary_rank_value(rank)
 }
 
 fn bomb_strength(combination: &Combination, level_rank: OrdinaryRank) -> Option<(u8, usize, u8)> {
@@ -477,7 +339,7 @@ fn bomb_strength(combination: &Combination, level_rank: OrdinaryRank) -> Option<
             .map(|rank| (3, combination.size, card_rank_strength(rank, level_rank))),
         CombinationKind::StraightFlush => combination
             .sequence_top
-            .map(|top| (2, 0, sequence_strength(top))),
+            .map(|top| (2, 0, ordinary_rank_value(top))),
         CombinationKind::Bomb => combination.primary_rank.map(|rank| {
             (
                 if combination.size == 5 { 1 } else { 0 },
@@ -497,13 +359,10 @@ pub fn can_beat(
     let challenger_is_bomb = is_bomb_combination(challenger.kind);
     let incumbent_is_bomb = is_bomb_combination(incumbent.kind);
 
-    if challenger_is_bomb && !incumbent_is_bomb {
-        return true;
+    if challenger_is_bomb != incumbent_is_bomb {
+        return challenger_is_bomb;
     }
-    if !challenger_is_bomb && incumbent_is_bomb {
-        return false;
-    }
-    if challenger_is_bomb && incumbent_is_bomb {
+    if challenger_is_bomb {
         return bomb_strength(challenger, level_rank) > bomb_strength(incumbent, level_rank);
     }
     if challenger.kind != incumbent.kind || challenger.size != incumbent.size {
@@ -513,7 +372,7 @@ pub fn can_beat(
     if let (Some(challenger_top), Some(incumbent_top)) =
         (challenger.sequence_top, incumbent.sequence_top)
     {
-        return sequence_strength(challenger_top) > sequence_strength(incumbent_top);
+        return ordinary_rank_value(challenger_top) > ordinary_rank_value(incumbent_top);
     }
     if let (Some(challenger_rank), Some(incumbent_rank)) =
         (challenger.primary_rank, incumbent.primary_rank)
@@ -526,28 +385,9 @@ pub fn can_beat(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
-
-    static NEXT_CARD_ID: AtomicUsize = AtomicUsize::new(0);
-
-    fn card(rank: CardRank, suit: OrdinarySuit) -> Card {
-        Card {
-            id: format!("test-card-{}", NEXT_CARD_ID.fetch_add(1, Ordering::Relaxed)),
-            deck_index: 0,
-            suit: if matches!(rank, CardRank::SmallJoker | CardRank::BigJoker) {
-                Suit::Joker
-            } else {
-                Suit::from(suit)
-            },
-            rank,
-        }
-    }
-
-    fn spade(rank: CardRank) -> Card {
-        card(rank, OrdinarySuit::Spade)
-    }
+    use crate::domain::test_support::{card, spade, spades};
+    use CardRank::*;
 
     fn declaration(
         kind: CombinationKind,
@@ -567,180 +407,52 @@ mod tests {
 
     #[test]
     fn recognizes_all_ten_prescribed_combination_kinds() {
-        assert_eq!(
-            resolve(&[spade(CardRank::Three)], None).kind,
-            CombinationKind::Single
-        );
-        assert_eq!(
-            resolve(&[spade(CardRank::Three), spade(CardRank::Three)], None).kind,
-            CombinationKind::Pair
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Four),
-                    spade(CardRank::Four),
-                    spade(CardRank::Four),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::Triple
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Five),
-                    spade(CardRank::Five),
-                    spade(CardRank::Five),
-                    spade(CardRank::Nine),
-                    spade(CardRank::Nine),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::FullHouse
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Three),
-                    spade(CardRank::Four),
-                    spade(CardRank::Five),
-                    spade(CardRank::Six),
-                    card(CardRank::Seven, OrdinarySuit::Club),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::Straight
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Three),
-                    spade(CardRank::Three),
-                    spade(CardRank::Four),
-                    spade(CardRank::Four),
-                    spade(CardRank::Five),
-                    spade(CardRank::Five),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::ConsecutivePairs
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Eight),
-                    spade(CardRank::Eight),
-                    spade(CardRank::Eight),
-                    spade(CardRank::Nine),
-                    spade(CardRank::Nine),
-                    spade(CardRank::Nine),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::ConsecutiveTriples
-        );
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Queen),
-                    spade(CardRank::Queen),
-                    spade(CardRank::Queen),
-                    spade(CardRank::Queen),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::Bomb
-        );
+        use CombinationKind::*;
 
-        let straight_flush = [
-            card(CardRank::Six, OrdinarySuit::Heart),
-            card(CardRank::Seven, OrdinarySuit::Heart),
-            card(CardRank::Eight, OrdinarySuit::Heart),
-            card(CardRank::Nine, OrdinarySuit::Heart),
-            card(CardRank::Ten, OrdinarySuit::Heart),
+        let cases: [(CombinationKind, &[CardRank]); 8] = [
+            (Single, &[Three]),
+            (Pair, &[Three, Three]),
+            (Triple, &[Four, Four, Four]),
+            (FullHouse, &[Five, Five, Five, Nine, Nine]),
+            (ConsecutivePairs, &[Three, Three, Four, Four, Five, Five]),
+            (ConsecutiveTriples, &[Eight, Eight, Eight, Nine, Nine, Nine]),
+            (Bomb, &[Queen, Queen, Queen, Queen]),
+            (JokerBomb, &[SmallJoker, SmallJoker, BigJoker, BigJoker]),
         ];
-        let straight_flush_declaration = declaration(
-            CombinationKind::StraightFlush,
-            None,
-            Some(OrdinaryRank::Ten),
-        );
-        assert_eq!(
-            resolve_combination(
-                &straight_flush,
-                OrdinaryRank::Queen,
-                Some(&straight_flush_declaration),
-            )
-            .unwrap()
-            .kind,
-            CombinationKind::StraightFlush
-        );
+        for (expected, ranks) in cases {
+            assert_eq!(resolve(&spades(ranks), None).kind, expected, "{ranks:?}");
+        }
 
+        let mut straight = spades(&[Three, Four, Five, Six, Seven]);
+        straight[4].suit = Suit::Club;
+        assert_eq!(resolve(&straight, None).kind, Straight);
+
+        let straight_flush =
+            [Six, Seven, Eight, Nine, Ten].map(|rank| card(rank, OrdinarySuit::Heart));
+        let declaration = declaration(StraightFlush, None, Some(OrdinaryRank::Ten));
         assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::SmallJoker),
-                    spade(CardRank::SmallJoker),
-                    spade(CardRank::BigJoker),
-                    spade(CardRank::BigJoker),
-                ],
-                None,
-            )
-            .kind,
-            CombinationKind::JokerBomb
+            resolve_combination(&straight_flush, OrdinaryRank::Queen, Some(&declaration),)
+                .unwrap()
+                .kind,
+            StraightFlush
         );
     }
 
     #[test]
     fn ace_is_low_or_high_but_does_not_wrap() {
-        let low = declaration(CombinationKind::Straight, None, Some(OrdinaryRank::Five));
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Ace),
-                    spade(CardRank::Two),
-                    spade(CardRank::Three),
-                    spade(CardRank::Four),
-                    spade(CardRank::Five),
-                ],
-                Some(&low),
-            )
-            .sequence_top,
-            Some(OrdinaryRank::Five)
-        );
-        let high = declaration(CombinationKind::Straight, None, Some(OrdinaryRank::Ace));
-        assert_eq!(
-            resolve(
-                &[
-                    spade(CardRank::Ten),
-                    spade(CardRank::Jack),
-                    spade(CardRank::Queen),
-                    spade(CardRank::King),
-                    spade(CardRank::Ace),
-                ],
-                Some(&high),
-            )
-            .sequence_top,
-            Some(OrdinaryRank::Ace)
-        );
+        for (ranks, top) in [
+            (&[Ace, Two, Three, Four, Five][..], OrdinaryRank::Five),
+            (&[Ten, Jack, Queen, King, Ace], OrdinaryRank::Ace),
+        ] {
+            let declaration = declaration(CombinationKind::Straight, None, Some(top));
+            assert_eq!(
+                resolve(&spades(ranks), Some(&declaration)).sequence_top,
+                Some(top)
+            );
+        }
         assert!(
-            list_combinations(
-                &[
-                    spade(CardRank::Jack),
-                    spade(CardRank::Queen),
-                    spade(CardRank::King),
-                    spade(CardRank::Ace),
-                    spade(CardRank::Two),
-                ],
-                OrdinaryRank::Seven,
-            )
-            .is_empty()
+            list_combinations(&spades(&[Jack, Queen, King, Ace, Two]), OrdinaryRank::Seven,)
+                .is_empty()
         );
     }
 
@@ -748,21 +460,13 @@ mod tests {
     fn wildcard_builds_bomb_but_is_natural_when_played_alone() {
         let wildcard = card(CardRank::Seven, OrdinarySuit::Heart);
         let bomb_declaration = declaration(CombinationKind::Bomb, Some(CardRank::Eight), None);
-        let bomb = resolve(
-            &[
-                spade(CardRank::Eight),
-                spade(CardRank::Eight),
-                spade(CardRank::Eight),
-                wildcard.clone(),
-            ],
-            Some(&bomb_declaration),
-        );
+        let mut cards = spades(&[CardRank::Eight; 3]);
+        cards.push(wildcard.clone());
+        let bomb = resolve(&cards, Some(&bomb_declaration));
         assert_eq!(bomb.kind, CombinationKind::Bomb);
         assert_eq!(
-            bomb.wildcard_assignments
-                .get(&wildcard.id)
-                .map(|item| item.rank),
-            Some(OrdinaryRank::Eight)
+            bomb.wildcard_assignments[&wildcard.id].rank,
+            OrdinaryRank::Eight
         );
 
         let single = resolve(&[wildcard], None);
@@ -772,60 +476,19 @@ mod tests {
 
     #[test]
     fn bomb_hierarchy_matches_rules() {
-        let four = resolve(
-            &[
-                spade(CardRank::Ace),
-                spade(CardRank::Ace),
-                spade(CardRank::Ace),
-                spade(CardRank::Ace),
-            ],
-            None,
-        );
-        let five = resolve(
-            &[
-                spade(CardRank::Two),
-                spade(CardRank::Two),
-                spade(CardRank::Two),
-                spade(CardRank::Two),
-                spade(CardRank::Two),
-            ],
-            None,
-        );
+        let four = resolve(&spades(&[Ace; 4]), None);
+        let five = resolve(&spades(&[Two; 5]), None);
         let flush_declaration = declaration(
             CombinationKind::StraightFlush,
             None,
             Some(OrdinaryRank::Seven),
         );
         let straight_flush = resolve(
-            &[
-                card(CardRank::Three, OrdinarySuit::Club),
-                card(CardRank::Four, OrdinarySuit::Club),
-                card(CardRank::Five, OrdinarySuit::Club),
-                card(CardRank::Six, OrdinarySuit::Club),
-                card(CardRank::Seven, OrdinarySuit::Club),
-            ],
+            &[Three, Four, Five, Six, Seven].map(|rank| card(rank, OrdinarySuit::Club)),
             Some(&flush_declaration),
         );
-        let six = resolve(
-            &[
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-            ],
-            None,
-        );
-        let jokers = resolve(
-            &[
-                spade(CardRank::SmallJoker),
-                spade(CardRank::SmallJoker),
-                spade(CardRank::BigJoker),
-                spade(CardRank::BigJoker),
-            ],
-            None,
-        );
+        let six = resolve(&spades(&[Three; 6]), None);
+        let jokers = resolve(&spades(&[SmallJoker, SmallJoker, BigJoker, BigJoker]), None);
 
         assert!(can_beat(&five, &four, OrdinaryRank::Seven));
         assert!(can_beat(&straight_flush, &five, OrdinaryRank::Seven));
@@ -836,13 +499,7 @@ mod tests {
 
     #[test]
     fn straight_flush_is_ambiguous_without_a_declaration() {
-        let cards = [
-            card(CardRank::Three, OrdinarySuit::Club),
-            card(CardRank::Four, OrdinarySuit::Club),
-            card(CardRank::Five, OrdinarySuit::Club),
-            card(CardRank::Six, OrdinarySuit::Club),
-            card(CardRank::Seven, OrdinarySuit::Club),
-        ];
+        let cards = [Three, Four, Five, Six, Seven].map(|rank| card(rank, OrdinarySuit::Club));
         let error = resolve_combination(&cards, OrdinaryRank::Nine, None).unwrap_err();
         assert_eq!(error.code, "AMBIGUOUS_COMBINATION");
         assert_eq!(
@@ -853,27 +510,16 @@ mod tests {
 
     #[test]
     fn duplicate_ids_and_joker_triples_are_invalid() {
+        let invalid = |cards: &[Card]| list_combinations(cards, OrdinaryRank::Seven).is_empty();
         let duplicated = spade(CardRank::Three);
-        assert!(
-            list_combinations(&[duplicated.clone(), duplicated], OrdinaryRank::Seven).is_empty()
-        );
-        assert!(
-            list_combinations(
-                &[
-                    spade(CardRank::SmallJoker),
-                    spade(CardRank::SmallJoker),
-                    spade(CardRank::SmallJoker),
-                ],
-                OrdinaryRank::Seven,
-            )
-            .is_empty()
-        );
+        assert!(invalid(&[duplicated.clone(), duplicated]));
+        assert!(invalid(&spades(&[CardRank::SmallJoker; 3])));
     }
 
     #[test]
     fn natural_level_strength_controls_non_sequence_comparison() {
-        let level_single = resolve(&[spade(CardRank::Seven)], None);
-        let ace_single = resolve(&[spade(CardRank::Ace)], None);
+        let level_single = resolve(&[spade(Seven)], None);
+        let ace_single = resolve(&[spade(Ace)], None);
         assert!(can_beat(&level_single, &ace_single, OrdinaryRank::Seven));
 
         let low_pairs = declaration(
@@ -882,14 +528,7 @@ mod tests {
             Some(OrdinaryRank::Three),
         );
         let combination = resolve(
-            &[
-                spade(CardRank::Ace),
-                spade(CardRank::Ace),
-                spade(CardRank::Two),
-                spade(CardRank::Two),
-                spade(CardRank::Three),
-                spade(CardRank::Three),
-            ],
+            &spades(&[Ace, Ace, Two, Two, Three, Three]),
             Some(&low_pairs),
         );
         assert_eq!(combination.sequence_top, Some(OrdinaryRank::Three));

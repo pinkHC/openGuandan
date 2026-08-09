@@ -1,21 +1,19 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
     net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::{
-    Router,
-    body::Body,
+    Json, Router,
     extract::{DefaultBodyLimit, Request},
     http::{
         HeaderValue, Method, StatusCode,
         header::{CACHE_CONTROL, RETRY_AFTER},
     },
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -29,7 +27,7 @@ use tower_http::{
 use crate::{
     config::ServerConfig,
     rooms::room_service::RoomService,
-    transport::{client_ip::client_ip, http, websocket},
+    transport::{client_ip::client_ip, http, rate_limit::RateWindow, websocket},
 };
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -39,7 +37,6 @@ const HTTP_RATE_MAX: u32 = 120;
 pub struct Application {
     pub router: Router,
     pub io: SocketIo,
-    pub rooms: RoomService,
     cleanup_task: JoinHandle<()>,
     publication_task: JoinHandle<()>,
 }
@@ -58,25 +55,11 @@ pub enum AppBuildError {
     InvalidCorsOrigin(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct HttpRateLimiter {
-    windows: Arc<Mutex<HashMap<Option<IpAddr>, HttpRateWindow>>>,
+    windows: Arc<Mutex<HashMap<Option<IpAddr>, RateWindow>>>,
     trust_proxy: bool,
-}
-
-impl Default for HttpRateLimiter {
-    fn default() -> Self {
-        Self {
-            windows: Arc::new(Mutex::new(HashMap::new())),
-            trust_proxy: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HttpRateWindow {
-    started_at: Instant,
-    count: u32,
+    initial_engine_handshakes_only: bool,
 }
 
 pub async fn build_application(config: &ServerConfig) -> Result<Application, AppBuildError> {
@@ -93,13 +76,14 @@ pub async fn build_application(config: &ServerConfig) -> Result<Application, App
     };
     let engine_handshake_limiter = HttpRateLimiter {
         trust_proxy: config.trust_proxy,
+        initial_engine_handshakes_only: true,
         ..HttpRateLimiter::default()
     };
     let router = http::routes(rooms.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             http_rate_limiter,
-            enforce_http_rate_limit,
+            enforce_rate_limit,
         ))
         .layer(middleware::from_fn(add_no_store_header))
         // Socket.IO must wrap the HTTP router, while CORS must wrap both.
@@ -109,7 +93,7 @@ pub async fn build_application(config: &ServerConfig) -> Result<Application, App
         // not consume additional handshake quota.
         .layer(middleware::from_fn_with_state(
             engine_handshake_limiter,
-            enforce_engine_handshake_rate_limit,
+            enforce_rate_limit,
         ))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
@@ -130,7 +114,6 @@ pub async fn build_application(config: &ServerConfig) -> Result<Application, App
     Ok(Application {
         router,
         io,
-        rooms,
         cleanup_task,
         publication_task,
     })
@@ -158,26 +141,17 @@ async fn add_no_store_header(request: Request, next: Next) -> Response {
     response
 }
 
-async fn enforce_http_rate_limit(
+async fn enforce_rate_limit(
     axum::extract::State(limiter): axum::extract::State<HttpRateLimiter>,
     request: Request,
     next: Next,
-) -> Result<Response, Infallible> {
-    if consume_rate_limit(&limiter, &request) {
-        return Ok(rate_limited_response());
+) -> Response {
+    if (!limiter.initial_engine_handshakes_only || is_initial_engine_handshake(&request))
+        && consume_rate_limit(&limiter, &request)
+    {
+        return rate_limited_response();
     }
-    Ok(next.run(request).await)
-}
-
-async fn enforce_engine_handshake_rate_limit(
-    axum::extract::State(limiter): axum::extract::State<HttpRateLimiter>,
-    request: Request,
-    next: Next,
-) -> Result<Response, Infallible> {
-    if is_initial_engine_handshake(&request) && consume_rate_limit(&limiter, &request) {
-        return Ok(rate_limited_response());
-    }
-    Ok(next.run(request).await)
+    next.run(request).await
 }
 
 fn is_initial_engine_handshake(request: &Request) -> bool {
@@ -201,55 +175,35 @@ fn has_valid_engine_sid(query: &str) -> bool {
 fn consume_rate_limit(limiter: &HttpRateLimiter, request: &Request) -> bool {
     let key = client_ip(request.headers(), request.extensions(), limiter.trust_proxy);
     let now = Instant::now();
-    {
-        let mut windows = limiter.windows.lock();
-        let count = {
-            let window = windows.entry(key).or_insert(HttpRateWindow {
-                started_at: now,
-                count: 0,
-            });
-            if now.duration_since(window.started_at) >= HTTP_RATE_WINDOW {
-                *window = HttpRateWindow {
-                    started_at: now,
-                    count: 0,
-                };
-            }
-            window.count = window.count.saturating_add(1);
-            window.count
-        };
-
-        if windows.len() > 4_096 {
-            windows
-                .retain(|_, candidate| now.duration_since(candidate.started_at) < HTTP_RATE_WINDOW);
-        }
-        count > HTTP_RATE_MAX
+    let mut windows = limiter.windows.lock();
+    let limited = windows
+        .entry(key)
+        .or_insert_with(|| RateWindow::new(now))
+        .consume(now, HTTP_RATE_WINDOW, HTTP_RATE_MAX);
+    if windows.len() > 4_096 {
+        windows.retain(|_, window| !window.window_elapsed(now, HTTP_RATE_WINDOW));
     }
+    limited
 }
 
 fn rate_limited_response() -> Response {
-    let mut response = Response::new(Body::from(
-        serde_json::to_vec(&json!({
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(RETRY_AFTER, "60")],
+        Json(json!({
             "error": {
                 "code": "RATE_LIMITED",
                 "message": "操作过于频繁，请稍后重试",
                 "details": null
             }
-        }))
-        .expect("static rate-limit response must serialize"),
-    ));
-    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
-        .headers_mut()
-        .insert(RETRY_AFTER, HeaderValue::from_static("60"));
-    response
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
     use axum::extract::ConnectInfo;
     use std::net::SocketAddr;
     use tower::ServiceExt;
@@ -260,27 +214,36 @@ mod tests {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
+    fn engine_request(uri: &str) -> Request {
+        let mut request = request(uri);
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_004))));
+        request
+    }
+
+    async fn engine_status(app: &Router, uri: &str) -> StatusCode {
+        let response = app.clone().oneshot(engine_request(uri)).await.unwrap();
+        response.status()
+    }
+
     #[test]
     fn engine_gate_matches_socketioxide_prefix_and_only_initial_opens() {
-        assert!(is_initial_engine_handshake(&request(
-            "/socket.io/?EIO=4&transport=websocket"
-        )));
-        assert!(is_initial_engine_handshake(&request(
-            "/socket.io/anything?EIO=4&transport=polling"
-        )));
-        assert!(is_initial_engine_handshake(&request(
-            "/socket.ioevil?EIO=4&transport=websocket"
-        )));
-        assert!(!is_initial_engine_handshake(&request(
-            "/socket.io/?EIO=4&transport=polling&sid=AAAAAAAAAAAAAAHs"
-        )));
-        assert!(is_initial_engine_handshake(&request(
-            "/socket.io/?EIO=4&transport=websocket&sid=!"
-        )));
-        assert!(is_initial_engine_handshake(&request(
-            "/socket.io/?EIO=4&transport=websocket&sid="
-        )));
-        assert!(!is_initial_engine_handshake(&request("/api/rooms")));
+        for (uri, expected) in [
+            ("/socket.io/?EIO=4&transport=websocket", true),
+            ("/socket.io/anything?EIO=4&transport=polling", true),
+            ("/socket.ioevil?EIO=4&transport=websocket", true),
+            (
+                "/socket.io/?EIO=4&transport=polling&sid=AAAAAAAAAAAAAAHs",
+                false,
+            ),
+            ("/socket.io/?EIO=4&transport=websocket&sid=!", true),
+            ("/socket.io/?EIO=4&transport=websocket&sid=", true),
+            ("/api/rooms", false),
+        ] {
+            let actual = is_initial_engine_handshake(&request(uri));
+            assert_eq!(actual, expected, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -288,38 +251,25 @@ mod tests {
         let app = Router::new()
             .fallback(|| async { StatusCode::NO_CONTENT })
             .layer(middleware::from_fn_with_state(
-                HttpRateLimiter::default(),
-                enforce_engine_handshake_rate_limit,
+                HttpRateLimiter {
+                    initial_engine_handshakes_only: true,
+                    ..HttpRateLimiter::default()
+                },
+                enforce_rate_limit,
             ));
-        let engine_request = |uri: &str| {
-            let mut request = request(uri);
-            request
-                .extensions_mut()
-                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_004))));
-            request
-        };
 
         for _ in 0..HTTP_RATE_MAX {
-            let response = app
-                .clone()
-                .oneshot(engine_request("/socket.io/?EIO=4&transport=polling"))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let status = engine_status(&app, "/socket.io/?EIO=4&transport=polling").await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
         }
-        let established = app
-            .clone()
-            .oneshot(engine_request(
-                "/socket.io/?EIO=4&transport=polling&sid=AAAAAAAAAAAAAAHs",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(established.status(), StatusCode::NO_CONTENT);
+        let status = engine_status(
+            &app,
+            "/socket.io/?EIO=4&transport=polling&sid=AAAAAAAAAAAAAAHs",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let limited = app
-            .oneshot(engine_request("/socket.io/?EIO=4&transport=websocket"))
-            .await
-            .unwrap();
-        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status = engine_status(&app, "/socket.io/?EIO=4&transport=websocket").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 }

@@ -1,5 +1,6 @@
 pub(crate) mod client_ip;
 pub mod http;
+pub(crate) mod rate_limit;
 pub mod websocket;
 
 pub(crate) fn utf16_len(value: &str) -> usize {

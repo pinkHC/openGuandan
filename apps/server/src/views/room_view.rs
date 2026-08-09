@@ -153,30 +153,20 @@ mod tests {
         let spectator = rooms.join_room(&host.room_code, "观众").unwrap();
 
         for (index, player) in players.iter().enumerate() {
-            rooms
-                .connect_socket(
-                    &player.room_code,
-                    &player.participant_id,
-                    &player.reconnect_token,
-                    &format!("view-{index}"),
-                )
-                .unwrap();
+            rooms.connect(player, &format!("view-{index}")).unwrap();
         }
         for (index, player) in players.iter().enumerate() {
             let version = rooms.require_room(&host.room_code).unwrap().version;
             rooms
                 .set_ready(
-                    &host.room_code,
-                    &player.participant_id,
-                    &format!("view-ready-{index}"),
-                    version,
+                    player.command(&format!("view-ready-{index}"), version),
                     true,
                 )
                 .unwrap();
         }
         let version = rooms.require_room(&host.room_code).unwrap().version;
         rooms
-            .start_match(&host.room_code, &host.participant_id, "view-start", version)
+            .start_match(host.command("view-start", version))
             .unwrap();
 
         let room = rooms.require_room(&host.room_code).unwrap();

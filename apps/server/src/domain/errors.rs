@@ -1,10 +1,12 @@
+use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, Serialize, thiserror::Error)]
 #[error("{message}")]
 pub struct RuleError {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
 

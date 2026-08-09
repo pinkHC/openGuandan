@@ -1,13 +1,12 @@
 use super::errors::RuleError;
-use super::types::{Card, CardRank, ORDINARY_RANKS, OrdinaryRank, Suit};
-
-pub const ORDINARY_SUITS: [Suit; 4] = [Suit::Heart, Suit::Diamond, Suit::Club, Suit::Spade];
+use super::types::{Card, CardRank, ORDINARY_RANKS, ORDINARY_SUITS, OrdinaryRank, Suit};
 
 pub fn create_deck() -> Vec<Card> {
     let mut cards = Vec::with_capacity(108);
 
     for deck_index in [0_u8, 1_u8] {
-        for suit in ORDINARY_SUITS {
+        for ordinary_suit in ORDINARY_SUITS {
+            let suit = Suit::from(ordinary_suit);
             for rank in ORDINARY_RANKS {
                 let rank = CardRank::from(rank);
                 cards.push(Card {
@@ -19,18 +18,14 @@ pub fn create_deck() -> Vec<Card> {
             }
         }
 
-        cards.push(Card {
-            id: format!("{deck_index}:joker:small-joker"),
-            deck_index,
-            suit: Suit::Joker,
-            rank: CardRank::SmallJoker,
-        });
-        cards.push(Card {
-            id: format!("{deck_index}:joker:big-joker"),
-            deck_index,
-            suit: Suit::Joker,
-            rank: CardRank::BigJoker,
-        });
+        for rank in [CardRank::SmallJoker, CardRank::BigJoker] {
+            cards.push(Card {
+                id: format!("{deck_index}:joker:{}", rank.as_str()),
+                deck_index,
+                suit: Suit::Joker,
+                rank,
+            });
+        }
     }
 
     cards
@@ -74,19 +69,13 @@ pub const fn card_rank_strength(rank: CardRank, level_rank: OrdinaryRank) -> u8 
     match rank {
         CardRank::BigJoker => 17,
         CardRank::SmallJoker => 16,
-        ordinary if matches!(ordinary.as_ordinary(), Some(value) if value.index() == level_rank.index()) => {
-            15
-        }
-        ordinary => match ordinary.as_ordinary() {
-            Some(value) => ordinary_rank_value(value),
-            None => unreachable!(),
-        },
+        ordinary if ordinary as usize == level_rank.index() => 15,
+        ordinary => ordinary as u8 + 2,
     }
 }
 
 pub fn is_wildcard(card: &Card, level_rank: OrdinaryRank) -> bool {
-    card.suit == Suit::Heart
-        && matches!(card.rank.as_ordinary(), Some(rank) if rank.index() == level_rank.index())
+    card.suit == Suit::Heart && card.rank as usize == level_rank.index()
 }
 
 pub fn sort_cards(cards: &[Card], level_rank: OrdinaryRank) -> Vec<Card> {

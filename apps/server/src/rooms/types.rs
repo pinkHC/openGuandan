@@ -10,6 +10,15 @@ use crate::domain::{match_state::MatchState, types::Seat};
 
 pub type PlayerId = String;
 
+/// Metadata shared by every state-changing room command.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandContext<'a> {
+    pub room_code: &'a str,
+    pub participant_id: &'a str,
+    pub action_id: &'a str,
+    pub expected_version: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParticipantRole {
@@ -68,6 +77,22 @@ pub struct ParticipantCredentials {
     pub seat: Option<Seat>,
 }
 
+#[cfg(test)]
+impl ParticipantCredentials {
+    pub(crate) fn command<'a>(
+        &'a self,
+        action_id: &'a str,
+        expected_version: u64,
+    ) -> CommandContext<'a> {
+        CommandContext {
+            room_code: &self.room_code,
+            participant_id: &self.participant_id,
+            action_id,
+            expected_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RoomEvent {
     pub event_type: &'static str,
@@ -88,23 +113,18 @@ pub type PublicationReceipt = oneshot::Receiver<()>;
 /// An immutable, commit-ordered item for the transport publisher.
 ///
 /// `Update` publishes domain events followed by the exact post-commit snapshot.
-/// `Barrier` is a two-phase read fence: the publisher signals `ready` after all
-/// preceding updates, then waits for `release` so a sync acknowledgement cannot
-/// be overtaken by a later room update.
+/// A `Fence` signals `ready` after preceding updates and, for a sync barrier,
+/// waits for `release` so its acknowledgement cannot be overtaken.
 #[derive(Debug)]
 pub enum PublicationMessage {
     Update {
         room: Arc<RoomState>,
         events: Vec<RoomEvent>,
-        completed: Option<oneshot::Sender<()>>,
-    },
-    Barrier {
-        room: Arc<RoomState>,
-        ready: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-    },
-    Flush {
         completed: oneshot::Sender<()>,
+    },
+    Fence {
+        ready: oneshot::Sender<()>,
+        release: Option<oneshot::Receiver<()>>,
     },
 }
 

@@ -20,7 +20,7 @@ use crate::domain::{
 };
 
 use super::types::{
-    CommandResult, Participant, ParticipantCredentials, ParticipantRole, PlayerId,
+    CommandContext, CommandResult, Participant, ParticipantCredentials, ParticipantRole, PlayerId,
     PublicationBarrier, PublicationMessage, PublicationReceipt, RoomEvent, RoomPhase, RoomState,
 };
 
@@ -112,10 +112,9 @@ impl RoomService {
         let room = Arc::new(rooms.get(&code).ok_or_else(room_not_found)?.clone());
         let (ready_tx, ready) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
-        let message = PublicationMessage::Barrier {
-            room: Arc::clone(&room),
+        let message = PublicationMessage::Fence {
             ready: ready_tx,
-            release: release_rx,
+            release: Some(release_rx),
         };
         permit.send(message);
         Ok(PublicationBarrier {
@@ -129,15 +128,9 @@ impl RoomService {
         &self,
         room: &RoomState,
         events: Vec<RoomEvent>,
-        with_receipt: bool,
         permit: mpsc::OwnedPermit<PublicationMessage>,
-    ) -> Option<PublicationReceipt> {
-        let (completed, publication) = if with_receipt {
-            let (completed, publication) = oneshot::channel();
-            (Some(completed), Some(publication))
-        } else {
-            (None, None)
-        };
+    ) -> PublicationReceipt {
+        let (completed, publication) = oneshot::channel();
         let message = PublicationMessage::Update {
             room: Arc::new(room.clone()),
             events,
@@ -149,7 +142,10 @@ impl RoomService {
 
     fn enqueue_flush(&self, permit: mpsc::OwnedPermit<PublicationMessage>) -> PublicationReceipt {
         let (completed, publication) = oneshot::channel();
-        permit.send(PublicationMessage::Flush { completed });
+        permit.send(PublicationMessage::Fence {
+            ready: completed,
+            release: None,
+        });
         publication
     }
 
@@ -177,12 +173,11 @@ impl RoomService {
         };
         let credentials = credentials(&room, &participant);
         rooms.insert(code.clone(), room);
-        self.enqueue_update(
+        drop(self.enqueue_update(
             rooms.get(&code).expect("newly inserted room exists"),
             Vec::new(),
-            false,
             publication_permit,
-        );
+        ));
         Ok(credentials)
     }
 
@@ -242,20 +237,17 @@ impl RoomService {
         room.version += 1;
         room.last_activity_at = now;
         let credentials = credentials(room, &participant);
-        self.enqueue_update(room, Vec::new(), false, publication_permit);
+        drop(self.enqueue_update(room, Vec::new(), publication_permit));
         Ok(credentials)
     }
 
-    pub fn get_room(&self, code: &str) -> Option<RoomState> {
+    pub fn require_room(&self, code: &str) -> Result<RoomState, RuleError> {
         self.inner
             .rooms
             .lock()
             .get(&normalize_room_code(code))
             .cloned()
-    }
-
-    pub fn require_room(&self, code: &str) -> Result<RoomState, RuleError> {
-        self.get_room(code).ok_or_else(room_not_found)
+            .ok_or_else(room_not_found)
     }
 
     pub fn authenticate(
@@ -275,6 +267,20 @@ impl RoomService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn connect(
+        &self,
+        participant: &ParticipantCredentials,
+        socket_id: &str,
+    ) -> Result<RoomState, RuleError> {
+        self.connect_socket(
+            &participant.room_code,
+            &participant.participant_id,
+            &participant.reconnect_token,
+            socket_id,
+        )
+    }
+
     pub fn connect_socket(
         &self,
         code: &str,
@@ -287,27 +293,23 @@ impl RoomService {
         let now = self.now();
         let mut rooms = self.inner.rooms.lock();
         let room = rooms.get_mut(&code).ok_or_else(room_not_found)?;
-        let became_connected = {
-            let participant = room
-                .participants
-                .get_mut(participant_id)
-                .ok_or_else(|| RuleError::new("INVALID_CREDENTIALS", "房间身份凭证无效"))?;
-            if participant.reconnect_token != reconnect_token {
-                return Err(RuleError::new("INVALID_CREDENTIALS", "房间身份凭证无效"));
-            }
-            if !participant.socket_ids.contains(socket_id)
-                && participant.socket_ids.len() >= MAX_SOCKETS_PER_PARTICIPANT
-            {
-                return Err(RuleError::new(
-                    "TOO_MANY_CONNECTIONS",
-                    "同一房间身份的连接数量过多",
-                ));
-            }
-            let was_connected = participant.connected();
-            participant.socket_ids.insert(socket_id.to_owned());
-            participant.disconnected_at = None;
-            !was_connected && participant.connected()
-        };
+        let participant = room
+            .participants
+            .get_mut(participant_id)
+            .filter(|participant| participant.reconnect_token == reconnect_token)
+            .ok_or_else(|| RuleError::new("INVALID_CREDENTIALS", "房间身份凭证无效"))?;
+        if !participant.socket_ids.contains(socket_id)
+            && participant.socket_ids.len() >= MAX_SOCKETS_PER_PARTICIPANT
+        {
+            return Err(RuleError::new(
+                "TOO_MANY_CONNECTIONS",
+                "同一房间身份的连接数量过多",
+            ));
+        }
+        let was_connected = participant.connected();
+        participant.socket_ids.insert(socket_id.to_owned());
+        participant.disconnected_at = None;
+        let became_connected = !was_connected && participant.connected();
         room.last_activity_at = now;
         let events = if became_connected {
             vec![RoomEvent::new(
@@ -317,7 +319,7 @@ impl RoomService {
         } else {
             Vec::new()
         };
-        self.enqueue_update(room, events, false, publication_permit);
+        drop(self.enqueue_update(room, events, publication_permit));
         Ok(room.clone())
     }
 
@@ -369,19 +371,16 @@ impl RoomService {
         } else {
             Vec::new()
         };
-        self.enqueue_update(room, events, false, publication_permit);
+        drop(self.enqueue_update(room, events, publication_permit));
         Some(room.clone())
     }
 
     pub fn set_ready(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
         ready: bool,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+        self.execute(command, |room, participant_id| {
             if room.phase != RoomPhase::Lobby {
                 return Err(RuleError::new("MATCH_ALREADY_STARTED", "一局牌已经开始"));
             }
@@ -396,13 +395,10 @@ impl RoomService {
 
     pub fn change_seat(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
         target_seat: Seat,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+        self.execute(command, |room, participant_id| {
             if room.phase != RoomPhase::Lobby {
                 return Err(RuleError::new("MATCH_ALREADY_STARTED", "一局牌已经开始"));
             }
@@ -437,14 +433,8 @@ impl RoomService {
         })
     }
 
-    pub fn start_match(
-        &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
-    ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+    pub fn start_match(&self, command: CommandContext<'_>) -> Result<CommandResult, RuleError> {
+        self.execute(command, |room, participant_id| {
             require_host(room, participant_id)?;
             if room.phase != RoomPhase::Lobby {
                 return Err(RuleError::new("MATCH_ALREADY_STARTED", "一局牌已经开始"));
@@ -472,14 +462,11 @@ impl RoomService {
 
     pub fn play_cards(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
         card_ids: &[String],
         declaration: Option<&CombinationDeclaration>,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+        self.execute(command, |room, participant_id| {
             let (match_state, seat) = active_match_for_player(room, participant_id)?;
             let outcome = play_match_cards(match_state, seat, card_ids, declaration)?;
             let Some(round_result) = outcome.round_result else {
@@ -508,44 +495,26 @@ impl RoomService {
         })
     }
 
-    pub fn pass(
-        &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
-    ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
-            let (match_state, seat) = active_match_for_player(room, participant_id)?;
-            pass_match_turn(match_state, seat)?;
-            Ok(vec![])
-        })
+    pub fn pass(&self, command: CommandContext<'_>) -> Result<CommandResult, RuleError> {
+        self.execute_silent_player_action(command, pass_match_turn)
     }
 
     pub fn give_tribute(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
         card_id: &str,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
-            let (match_state, seat) = active_match_for_player(room, participant_id)?;
-            give_match_tribute(match_state, seat, card_id)?;
-            Ok(vec![])
+        self.execute_silent_player_action(command, |match_state, seat| {
+            give_match_tribute(match_state, seat, card_id)
         })
     }
 
     pub fn return_tribute(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
         card_id: &str,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+        self.execute(command, |room, participant_id| {
             let (match_state, seat) = active_match_for_player(room, participant_id)?;
             let Some(tribute) = return_match_tribute(match_state, seat, card_id)? else {
                 return Ok(vec![]);
@@ -575,12 +544,9 @@ impl RoomService {
 
     pub fn start_next_round(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
+        command: CommandContext<'_>,
     ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+        self.execute(command, |room, participant_id| {
             require_host(room, participant_id)?;
             require_all_players_connected(room)?;
             let round = start_next_round(active_match(room)?)?;
@@ -595,14 +561,8 @@ impl RoomService {
         })
     }
 
-    pub fn abort_match(
-        &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
-    ) -> Result<CommandResult, RuleError> {
-        self.execute(code, participant_id, action_id, expected_version, |room| {
+    pub fn abort_match(&self, command: CommandContext<'_>) -> Result<CommandResult, RuleError> {
+        self.execute(command, |room, participant_id| {
             require_host(room, participant_id)?;
             if room.match_state.is_none() {
                 return Err(RuleError::new("NO_ACTIVE_MATCH", "当前没有进行中的一局牌"));
@@ -615,15 +575,30 @@ impl RoomService {
         })
     }
 
+    fn execute_silent_player_action(
+        &self,
+        command: CommandContext<'_>,
+        operation: impl FnOnce(&mut MatchState, Seat) -> Result<(), RuleError>,
+    ) -> Result<CommandResult, RuleError> {
+        self.execute(command, |room, participant_id| {
+            let (match_state, seat) = active_match_for_player(room, participant_id)?;
+            operation(match_state, seat)?;
+            Ok(Vec::new())
+        })
+    }
+
     fn execute(
         &self,
-        code: &str,
-        participant_id: &str,
-        action_id: &str,
-        expected_version: u64,
-        operation: impl FnOnce(&mut RoomState) -> Result<Vec<RoomEvent>, RuleError>,
+        command: CommandContext<'_>,
+        operation: impl FnOnce(&mut RoomState, &str) -> Result<Vec<RoomEvent>, RuleError>,
     ) -> Result<CommandResult, RuleError> {
-        let code = normalize_room_code(code);
+        let CommandContext {
+            room_code,
+            participant_id,
+            action_id,
+            expected_version,
+        } = command;
+        let code = normalize_room_code(room_code);
         let publication_permit = self.try_reserve_publication()?;
         let now = self.now();
         let mut rooms = self.inner.rooms.lock();
@@ -644,16 +619,14 @@ impl RoomService {
             );
         }
 
-        let events = operation(room)?;
+        let events = operation(room, participant_id)?;
         room.version += 1;
         room.last_activity_at = now;
         room.processed_commands.insert(key, room.version);
         while room.processed_commands.len() > MAX_PROCESSED_COMMANDS {
             room.processed_commands.shift_remove_index(0);
         }
-        let publication = self
-            .enqueue_update(room, events, true, publication_permit)
-            .expect("command updates request a publication receipt");
+        let publication = self.enqueue_update(room, events, publication_permit);
         Ok(CommandResult {
             version: room.version,
             duplicate: false,
@@ -675,39 +648,35 @@ impl RoomService {
                 }
             };
             let mut rooms = self.inner.rooms.lock();
-            let should_delete = {
-                let Some(room) = rooms.get_mut(&code) else {
-                    continue;
-                };
-                let version_before_cleanup = room.version;
-                if room.phase == RoomPhase::Lobby {
-                    let expired: Vec<PlayerId> = room
-                        .participants
-                        .values()
-                        .filter(|participant| {
-                            !participant.connected()
-                                && participant.disconnected_at.is_some_and(|disconnected_at| {
-                                    now.saturating_sub(disconnected_at)
-                                        >= self.inner.reconnect_grace_ms
-                                })
-                        })
-                        .map(|participant| participant.id.clone())
-                        .collect();
-                    for participant_id in expired {
-                        remove_participant(room, &participant_id);
-                    }
-                }
-
-                let any_connected = room.participants.values().any(Participant::connected);
-                let should_delete = !any_connected
-                    && now.saturating_sub(room.last_activity_at) >= self.inner.room_idle_ttl_ms;
-                if !should_delete && room.version != version_before_cleanup {
-                    self.enqueue_update(room, Vec::new(), false, publication_permit);
-                } else {
-                    drop(publication_permit);
-                }
-                should_delete
+            let Some(room) = rooms.get_mut(&code) else {
+                continue;
             };
+            let version_before_cleanup = room.version;
+            if room.phase == RoomPhase::Lobby {
+                let expired: Vec<PlayerId> = room
+                    .participants
+                    .values()
+                    .filter(|participant| {
+                        !participant.connected()
+                            && participant.disconnected_at.is_some_and(|disconnected_at| {
+                                now.saturating_sub(disconnected_at) >= self.inner.reconnect_grace_ms
+                            })
+                    })
+                    .map(|participant| participant.id.clone())
+                    .collect();
+                for participant_id in expired {
+                    remove_participant(room, &participant_id);
+                }
+            }
+
+            let any_connected = room.participants.values().any(Participant::connected);
+            let should_delete = !any_connected
+                && now.saturating_sub(room.last_activity_at) >= self.inner.room_idle_ttl_ms;
+            if !should_delete && room.version != version_before_cleanup {
+                drop(self.enqueue_update(room, Vec::new(), publication_permit));
+            } else {
+                drop(publication_permit);
+            }
 
             if should_delete {
                 rooms.shift_remove(&code);
@@ -741,7 +710,7 @@ fn room_not_found() -> RuleError {
 
 fn validate_display_name(display_name: &str) -> Result<String, RuleError> {
     let trimmed = display_name.trim();
-    let length = trimmed.chars().count();
+    let length = trimmed.encode_utf16().count();
     if !(1..=20).contains(&length) {
         return Err(RuleError::new(
             "INVALID_DISPLAY_NAME",
@@ -929,16 +898,22 @@ mod tests {
     }
 
     #[test]
+    fn display_name_limit_counts_utf16_code_units() {
+        let rooms = RoomService::default();
+        assert!(rooms.create_room(&"😀".repeat(10)).is_ok());
+        let error = rooms.create_room(&"😀".repeat(11)).unwrap_err();
+        assert_eq!(error.code, "INVALID_DISPLAY_NAME");
+    }
+
+    #[test]
     fn duplicate_command_wins_before_stale_version_check() {
         let rooms = RoomService::default();
         let host = rooms.create_room("甲").unwrap();
-        let result = rooms
-            .set_ready(&host.room_code, &host.participant_id, "action-01", 1, true)
-            .unwrap();
+        let result = rooms.set_ready(host.command("action-01", 1), true).unwrap();
         assert_eq!(result.version, 2);
 
         let duplicate = rooms
-            .set_ready(&host.room_code, &host.participant_id, "action-01", 0, false)
+            .set_ready(host.command("action-01", 0), false)
             .unwrap();
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.version, 2);
@@ -953,23 +928,11 @@ mod tests {
         let host = rooms.create_room("甲").unwrap();
         let player = rooms.join_room(&host.room_code, "乙").unwrap();
         rooms
-            .set_ready(
-                &host.room_code,
-                &player.participant_id,
-                "ready-001",
-                2,
-                true,
-            )
+            .set_ready(player.command("ready-001", 2), true)
             .unwrap();
 
         let result = rooms
-            .change_seat(
-                &host.room_code,
-                &player.participant_id,
-                "change-01",
-                3,
-                Seat::THREE,
-            )
+            .change_seat(player.command("change-01", 3), Seat::THREE)
             .unwrap();
 
         assert_eq!(result.version, 4);
@@ -989,13 +952,7 @@ mod tests {
         let player = rooms.join_room(&host.room_code, "乙").unwrap();
 
         let error = rooms
-            .change_seat(
-                &host.room_code,
-                &host.participant_id,
-                "change-01",
-                2,
-                Seat::ONE,
-            )
+            .change_seat(host.command("change-01", 2), Seat::ONE)
             .unwrap_err();
 
         assert_eq!(error.code, "SEAT_OCCUPIED");
@@ -1017,14 +974,8 @@ mod tests {
         let spectator = rooms.join_room(&host.room_code, "观众").unwrap();
 
         for (index, participant) in [&host, &second, &third, &spectator].into_iter().enumerate() {
-            rooms
-                .connect_socket(
-                    &participant.room_code,
-                    &participant.participant_id,
-                    &participant.reconnect_token,
-                    &format!("socket-{index}"),
-                )
-                .unwrap();
+            let socket_id = format!("socket-{index}");
+            rooms.connect(participant, &socket_id).unwrap();
         }
         now.store(1_100, Ordering::Relaxed);
         assert!(rooms.remove_expired().await.is_empty());
@@ -1033,13 +984,7 @@ mod tests {
         assert_eq!(room.seats[3], None);
 
         rooms
-            .change_seat(
-                &host.room_code,
-                &spectator.participant_id,
-                "change-01",
-                room.version,
-                Seat::THREE,
-            )
+            .change_seat(spectator.command("change-01", room.version), Seat::THREE)
             .unwrap();
 
         let room = rooms.require_room(&host.room_code).unwrap();
@@ -1054,24 +999,10 @@ mod tests {
         let rooms = RoomService::default();
         let host = rooms.create_room("甲").unwrap();
         for index in 0..MAX_SOCKETS_PER_PARTICIPANT {
-            rooms
-                .connect_socket(
-                    &host.room_code,
-                    &host.participant_id,
-                    &host.reconnect_token,
-                    &format!("socket-{index}"),
-                )
-                .unwrap();
+            rooms.connect(&host, &format!("socket-{index}")).unwrap();
         }
 
-        let error = rooms
-            .connect_socket(
-                &host.room_code,
-                &host.participant_id,
-                &host.reconnect_token,
-                "one-too-many",
-            )
-            .unwrap_err();
+        let error = rooms.connect(&host, "one-too-many").unwrap_err();
         assert_eq!(error.code, "TOO_MANY_CONNECTIONS");
     }
 
@@ -1095,14 +1026,7 @@ mod tests {
         let rooms = RoomService::with_clock(100, 10_000, move || clock.load(Ordering::Relaxed));
         let host = rooms.create_room("甲").unwrap();
         let replacement = rooms.join_room(&host.room_code, "乙").unwrap();
-        rooms
-            .connect_socket(
-                &replacement.room_code,
-                &replacement.participant_id,
-                &replacement.reconnect_token,
-                "replacement-socket",
-            )
-            .unwrap();
+        rooms.connect(&replacement, "replacement-socket").unwrap();
 
         now.store(1_100, Ordering::Relaxed);
         assert!(rooms.remove_expired().await.is_empty());

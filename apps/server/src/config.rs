@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, str::FromStr};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 3004;
@@ -49,22 +49,29 @@ impl ServerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let defaults = Self::default();
         let host = env::var("HOST").unwrap_or(defaults.host);
-        let port = parse_u16("PORT", env::var("PORT").ok(), defaults.port)?;
+        let port = parse_positive(
+            "PORT",
+            env::var("PORT").ok(),
+            defaults.port,
+            "must be an integer from 1 to 65535",
+        )?;
         let cors = env::var("CORS_ORIGIN").unwrap_or_else(|_| DEFAULT_CORS_ORIGIN.to_owned());
         let trust_proxy = parse_bool(
             "TRUST_PROXY",
             env::var("TRUST_PROXY").ok(),
             defaults.trust_proxy,
         )?;
-        let room_idle_ttl_ms = parse_positive_u64(
+        let room_idle_ttl_ms = parse_positive(
             "ROOM_IDLE_TTL_MS",
             env::var("ROOM_IDLE_TTL_MS").ok(),
             defaults.room_idle_ttl_ms,
+            "must be a positive integer",
         )?;
-        let reconnect_grace_ms = parse_positive_u64(
+        let reconnect_grace_ms = parse_positive(
             "RECONNECT_GRACE_MS",
             env::var("RECONNECT_GRACE_MS").ok(),
             defaults.reconnect_grace_ms,
+            "must be a positive integer",
         )?;
 
         Ok(Self {
@@ -99,41 +106,22 @@ fn parse_bool(
     }
 }
 
-fn parse_u16(
+fn parse_positive<T>(
     variable: &'static str,
     raw: Option<String>,
-    default: u16,
-) -> Result<u16, ConfigError> {
+    default: T,
+    reason: &'static str,
+) -> Result<T, ConfigError>
+where
+    T: Default + FromStr + PartialEq,
+{
     let Some(raw) = raw else {
         return Ok(default);
     };
-    let parsed = raw
-        .parse::<u16>()
-        .map_err(|_| ConfigError::invalid(variable, "must be an integer from 1 to 65535"))?;
-    if parsed == 0 {
-        return Err(ConfigError::invalid(
-            variable,
-            "must be an integer from 1 to 65535",
-        ));
-    }
-    Ok(parsed)
-}
-
-fn parse_positive_u64(
-    variable: &'static str,
-    raw: Option<String>,
-    default: u64,
-) -> Result<u64, ConfigError> {
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-    let parsed = raw
-        .parse::<u64>()
-        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
-    if parsed == 0 {
-        return Err(ConfigError::invalid(variable, "must be a positive integer"));
-    }
-    Ok(parsed)
+    raw.parse()
+        .ok()
+        .filter(|value| *value != T::default())
+        .ok_or_else(|| ConfigError::invalid(variable, reason))
 }
 
 #[cfg(test)]
