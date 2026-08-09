@@ -394,6 +394,49 @@ impl RoomService {
         })
     }
 
+    pub fn change_seat(
+        &self,
+        code: &str,
+        participant_id: &str,
+        action_id: &str,
+        expected_version: u64,
+        target_seat: Seat,
+    ) -> Result<CommandResult, RuleError> {
+        self.execute(code, participant_id, action_id, expected_version, |room| {
+            if room.phase != RoomPhase::Lobby {
+                return Err(RuleError::new("MATCH_ALREADY_STARTED", "一局牌已经开始"));
+            }
+            let previous_seat = participant(room, participant_id)?.seat;
+            if previous_seat == Some(target_seat) {
+                return Err(RuleError::new("SEAT_UNCHANGED", "玩家已在该座位"));
+            }
+            if room.seats[target_seat.index()].is_some() {
+                return Err(RuleError::new("SEAT_OCCUPIED", "该座位已被其他玩家占用"));
+            }
+            if let Some(previous_seat) = previous_seat {
+                room.seats[previous_seat.index()] = None;
+            }
+            room.seats[target_seat.index()] = Some(participant_id.to_owned());
+
+            let participant = room
+                .participants
+                .get_mut(participant_id)
+                .expect("validated participant remains in the room");
+            participant.role = ParticipantRole::Player;
+            participant.seat = Some(target_seat);
+            participant.ready = false;
+
+            Ok(vec![RoomEvent::new(
+                "room.seat_changed",
+                json!({
+                    "participantId": participant_id,
+                    "fromSeat": previous_seat,
+                    "toSeat": target_seat,
+                }),
+            )])
+        })
+    }
+
     pub fn start_match(
         &self,
         code: &str,
@@ -902,6 +945,108 @@ mod tests {
         assert!(
             rooms.require_room(&host.room_code).unwrap().participants[&host.participant_id].ready
         );
+    }
+
+    #[test]
+    fn player_can_move_to_any_empty_seat_and_must_ready_again() {
+        let rooms = RoomService::default();
+        let host = rooms.create_room("甲").unwrap();
+        let player = rooms.join_room(&host.room_code, "乙").unwrap();
+        rooms
+            .set_ready(
+                &host.room_code,
+                &player.participant_id,
+                "ready-001",
+                2,
+                true,
+            )
+            .unwrap();
+
+        let result = rooms
+            .change_seat(
+                &host.room_code,
+                &player.participant_id,
+                "change-01",
+                3,
+                Seat::THREE,
+            )
+            .unwrap();
+
+        assert_eq!(result.version, 4);
+        let room = rooms.require_room(&host.room_code).unwrap();
+        let moved = &room.participants[&player.participant_id];
+        assert_eq!(room.seats[1], None);
+        assert_eq!(room.seats[3], Some(player.participant_id));
+        assert_eq!(moved.role, ParticipantRole::Player);
+        assert_eq!(moved.seat, Some(Seat::THREE));
+        assert!(!moved.ready);
+    }
+
+    #[test]
+    fn occupied_seat_cannot_be_selected() {
+        let rooms = RoomService::default();
+        let host = rooms.create_room("甲").unwrap();
+        let player = rooms.join_room(&host.room_code, "乙").unwrap();
+
+        let error = rooms
+            .change_seat(
+                &host.room_code,
+                &host.participant_id,
+                "change-01",
+                2,
+                Seat::ONE,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "SEAT_OCCUPIED");
+        let room = rooms.require_room(&host.room_code).unwrap();
+        assert_eq!(room.version, 2);
+        assert_eq!(room.seats[0], Some(host.participant_id));
+        assert_eq!(room.seats[1], Some(player.participant_id));
+    }
+
+    #[tokio::test]
+    async fn spectator_can_take_a_seat_released_during_the_lobby() {
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = Arc::clone(&now);
+        let rooms = RoomService::with_clock(100, 10_000, move || clock.load(Ordering::Relaxed));
+        let host = rooms.create_room("甲").unwrap();
+        let second = rooms.join_room(&host.room_code, "乙").unwrap();
+        let third = rooms.join_room(&host.room_code, "丙").unwrap();
+        let expired = rooms.join_room(&host.room_code, "丁").unwrap();
+        let spectator = rooms.join_room(&host.room_code, "观众").unwrap();
+
+        for (index, participant) in [&host, &second, &third, &spectator].into_iter().enumerate() {
+            rooms
+                .connect_socket(
+                    &participant.room_code,
+                    &participant.participant_id,
+                    &participant.reconnect_token,
+                    &format!("socket-{index}"),
+                )
+                .unwrap();
+        }
+        now.store(1_100, Ordering::Relaxed);
+        assert!(rooms.remove_expired().await.is_empty());
+        let room = rooms.require_room(&host.room_code).unwrap();
+        assert!(!room.participants.contains_key(&expired.participant_id));
+        assert_eq!(room.seats[3], None);
+
+        rooms
+            .change_seat(
+                &host.room_code,
+                &spectator.participant_id,
+                "change-01",
+                room.version,
+                Seat::THREE,
+            )
+            .unwrap();
+
+        let room = rooms.require_room(&host.room_code).unwrap();
+        let seated = &room.participants[&spectator.participant_id];
+        assert_eq!(room.seats[3], Some(spectator.participant_id));
+        assert_eq!(seated.role, ParticipantRole::Player);
+        assert_eq!(seated.seat, Some(Seat::THREE));
     }
 
     #[test]

@@ -168,6 +168,7 @@ socket.emit("room.sync", (response) => {
 | 事件 | 附加字段 | 权限 |
 | --- | --- | --- |
 | `room.ready` | `ready: boolean` | 座位玩家 |
+| `room.change_seat` | `seat: 0 \| 1 \| 2 \| 3` | 大厅内所有参与者；目标座位须为空 |
 | `match.start` | 无 | 房主；四人已连接且全部准备 |
 | `match.abort` | 无 | 房主 |
 | `round.next` | 无 | 房主；上一轮已经结算 |
@@ -221,6 +222,7 @@ joker-bomb
 | `room.snapshot` | 针对当前连接生成的完整最新视图 |
 | `participant.connection` | 参与者连接状态变化 |
 | `room.ready` | 准备状态变化 |
+| `room.seat_changed` | 玩家入座或换位；换位后该玩家恢复为未准备 |
 | `match.started` | 一局牌开始 |
 | `match.aborted` | 房主终止当前一局牌 |
 | `round.started` | 新一轮牌开始 |

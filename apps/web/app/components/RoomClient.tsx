@@ -46,7 +46,7 @@ function relativePosition(seat: Seat, selfSeat: Seat | null): "south" | "west" |
   return (["south", "west", "north", "east"] as const)[relative];
 }
 
-function SeatBadge({ snapshot, seat, selfSeat, showReady = false }: { snapshot: RoomSnapshot; seat: Seat; selfSeat: Seat | null; showReady?: boolean }) {
+export function SeatBadge({ snapshot, seat, selfSeat, showReady = false, onSelect, disabled = false }: { snapshot: RoomSnapshot; seat: Seat; selfSeat: Seat | null; showReady?: boolean; onSelect?: (seat: Seat) => void; disabled?: boolean }) {
   const participant = participantAt(snapshot, seat);
   const round = snapshot.match?.currentRound;
   const position = relativePosition(seat, selfSeat);
@@ -59,13 +59,16 @@ function SeatBadge({ snapshot, seat, selfSeat, showReady = false }: { snapshot: 
         ? FINISH_NAMES[round?.finishOrder.indexOf(seat) ?? 0]
         : `${round?.handCounts[String(seat)] ?? 0} 张`
     : `座位 ${seat + 1}`;
-  return (
-    <div className={`seat-badge seat-badge--${position} ${isTurn ? "is-turn" : ""} ${participant?.connected === false ? "is-offline" : ""}`}>
+  const className = `seat-badge seat-badge--${position} ${isTurn ? "is-turn" : ""} ${participant?.connected === false ? "is-offline" : ""} ${!participant && onSelect ? "seat-badge--selectable" : ""}`;
+  const content = <>
       <span className="seat-badge__avatar">{participant?.displayName.slice(0, 1).toUpperCase() ?? "?"}</span>
-      <span className="seat-badge__copy"><b>{participant?.displayName ?? "等待入座"}{snapshot.self?.seat === seat ? "（你）" : ""}</b><small>{secondary}</small></span>
+      <span className="seat-badge__copy"><b>{participant?.displayName ?? "选择此座位"}{snapshot.self?.seat === seat ? "（你）" : ""}</b><small>{!participant && onSelect ? `座位 ${seat + 1} · 点击入座` : secondary}</small></span>
       {showReady && participant && <span className={`ready-dot ${participant.ready ? "is-ready" : ""}`}>{participant.ready ? "已准备" : "未准备"}</span>}
-    </div>
-  );
+    </>;
+  if (!participant && onSelect) {
+    return <button type="button" className={className} disabled={disabled} onClick={() => onSelect(seat)} aria-label={`选择座位 ${seat + 1}`}>{content}</button>;
+  }
+  return <div className={className}>{content}</div>;
 }
 
 function JoinRoom({ roomCode, onJoined }: { roomCode: string; onJoined: (credentials: ParticipantCredentials) => void }) {
@@ -244,10 +247,10 @@ export function RoomClient({ roomCode }: { roomCode: string }) {
         <section className="loading-screen loading-screen--room"><span className="spinner" /><h1>正在布置牌桌</h1><p>我们正在获取房间的最新状态。</p></section>
       ) : snapshot.phase === "lobby" ? (
         <section className="lobby-view">
-          <div className="lobby-heading"><div><p className="eyebrow"><span /> 等候大厅</p><h1>坐满四人，准备开局。</h1><p>相对而坐的玩家互为搭档。房主在所有人准备后开始本局。</p></div><div className="team-legend"><span><i className="team-a" />甲队 · 座位 1、3</span><span><i className="team-b" />乙队 · 座位 2、4</span></div></div>
+          <div className="lobby-heading"><div><p className="eyebrow"><span /> 等候大厅</p><h1>坐满四人，准备开局。</h1><p>相对而坐的玩家互为搭档。点击任意空座即可入座或换位，换位后需重新准备。</p></div><div className="team-legend"><span><i className="team-a" />甲队 · 座位 1、3</span><span><i className="team-b" />乙队 · 座位 2、4</span></div></div>
           <div className="lobby-layout">
             <div className="lobby-table">
-              <div className="lobby-table__felt"><span className="felt-mark">掼<br />蛋</span>{SEATS.map((seat) => <SeatBadge key={seat} snapshot={snapshot} seat={seat} selfSeat={snapshot.self?.seat ?? 0} showReady />)}</div>
+              <div className="lobby-table__felt"><span className="felt-mark">掼<br />蛋</span>{SEATS.map((seat) => <SeatBadge key={seat} snapshot={snapshot} seat={seat} selfSeat={snapshot.self?.seat ?? 0} showReady disabled={!canAct} onSelect={(targetSeat) => void emitCommand("room.change_seat", { seat: targetSeat })} />)}</div>
             </div>
             <aside className="lobby-sidebar">
               <div className="sidebar-card"><span className="sidebar-card__number">{snapshot.seats.filter(Boolean).length}<small>/4</small></span><div><b>玩家已入座</b><p>{snapshot.seats.every(Boolean) ? "人员到齐，等待全部准备。" : "把房间码分享给朋友。"}</p></div></div>

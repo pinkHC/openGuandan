@@ -442,6 +442,20 @@ test("Rust server is compatible with socket.io-client 4.8.3", { timeout: 120_000
     assert.equal(publicationOrder[0], "snapshot");
     socket.off("room.snapshot", observeReadySnapshot);
 
+    const changedSeatSnapshot = waitForSnapshotVersion(socket, 3);
+    const changedSeatResponse = await emitWithAck(socket, "room.change_seat", {
+      actionId: "socket-change-seat",
+      version: 2,
+      seat: 3,
+    });
+    assert.equal(changedSeatResponse?.ok, true);
+    assert.equal(changedSeatResponse?.version, 3);
+    const changedSeat = await changedSeatSnapshot;
+    assert.equal(changedSeat.self.seat, 3);
+    assert.equal(changedSeat.self.ready, false);
+    assert.equal(changedSeat.seats[0], null);
+    assert.equal(changedSeat.seats[3], credentials.participantId);
+
     const staleResponse = await emitWithAck(socket, "room.ready", {
       actionId: "socket-stale-action",
       version: 1,

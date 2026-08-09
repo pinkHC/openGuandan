@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     domain::{
         errors::RuleError,
-        types::{CardRank, CombinationDeclaration, CombinationKind, OrdinaryRank},
+        types::{CardRank, CombinationDeclaration, CombinationKind, OrdinaryRank, Seat},
     },
     rooms::{
         room_service::RoomService,
@@ -177,6 +177,14 @@ struct ReadyPayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChangeSeatPayload {
+    action_id: String,
+    version: u64,
+    seat: Seat,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SimpleActionPayload {
     action_id: String,
     version: u64,
@@ -236,6 +244,13 @@ where
 }
 
 impl ValidatePayload for ReadyPayload {
+    fn validate(self) -> Result<Self, ErrorPayload> {
+        validate_action_id(&self.action_id)?;
+        Ok(self)
+    }
+}
+
+impl ValidatePayload for ChangeSeatPayload {
     fn validate(self) -> Result<Self, ErrorPayload> {
         validate_action_id(&self.action_id)?;
         Ok(self)
@@ -456,6 +471,21 @@ fn register_message_handlers(socket: &SocketRef, rooms: &RoomService) {
                 &payload.action_id,
                 payload.version,
                 payload.ready,
+            )
+        },
+    );
+
+    register_command_handler::<ChangeSeatPayload, _>(
+        socket,
+        rooms,
+        "room.change_seat",
+        |rooms, identity, payload| {
+            rooms.change_seat(
+                &identity.room_code,
+                &identity.participant_id,
+                &payload.action_id,
+                payload.version,
+                payload.seat,
             )
         },
     );
@@ -849,6 +879,22 @@ mod tests {
             serde_json::from_value::<DeclarationPayload>(json!({
                 "kind": "single",
                 "primaryRank": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ChangeSeatPayload>(json!({
+                "actionId": "action-01",
+                "version": 1,
+                "seat": 3
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<ChangeSeatPayload>(json!({
+                "actionId": "action-01",
+                "version": 1,
+                "seat": 4
             }))
             .is_err()
         );
